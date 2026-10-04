@@ -92,11 +92,8 @@ type FetchOutcome = { status: number; retryAfterSeconds: number | null; body: un
 export function createClickUp(token: string, deps: ClickUpDeps = {}): ClickUp {
   const fetchImpl = deps.fetch ?? fetch
   const clock = deps.clock ?? realClock
-  let queue = tokenQueues.get(token)
-  if (!queue) {
-    queue = new RequestQueue()
-    tokenQueues.set(token, queue)
-  }
+  const queue = tokenQueues.get(token) ?? new RequestQueue()
+  tokenQueues.set(token, queue)
 
   async function get(path: string, deadline: Deadline, guard?: RequestGuard): Promise<unknown> {
     if (deadline.expired()) throw new Error(DEADLINE_ERROR)
