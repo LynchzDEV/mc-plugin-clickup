@@ -5,5 +5,8 @@
   "type": "module",
   "dependencies": {
     "@mission-control/plugin-sdk": "github:LynchzDEV/mc-plugin-sdk#v0.1.0"
+  },
+  "devDependencies": {
+    "@happy-dom/global-registrator": "^20.14.5"
   }
 }
