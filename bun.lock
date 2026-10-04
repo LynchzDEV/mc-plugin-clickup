@@ -1,0 +1,20 @@
+{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "mc-plugin-clickup",
+      "dependencies": {
+        "@mission-control/plugin-sdk": "github:LynchzDEV/mc-plugin-sdk#v0.1.0",
+      },
+    },
+  },
+  "packages": {
+    "@mission-control/plugin-sdk": ["@mission-control/plugin-sdk@github:LynchzDEV/mc-plugin-sdk#fdcc211", { "dependencies": { "comlink": "^4.4.2", "vscode-jsonrpc": "^9.0.3", "zod": "4" } }, "LynchzDEV-mc-plugin-sdk-fdcc211"],
+
+    "comlink": ["comlink@4.4.2", "", {}, "sha512-OxGdvBmJuNKSCMO4NTl1L47VRp6xn2wG4F/2hYzB6tiCb709otOxtEYCSvK80PtjODfXXZu8ds+Nw5kVCjqd2g=="],
+
+    "vscode-jsonrpc": ["vscode-jsonrpc@9.0.3", "", {}, "sha512-qETYf9PCl1lVfwR+oBmMfc4vP2nqLNA35ABxorw3j06+xlKRgDVxbLgKm4Y/xPL0YWdeDjLoI4ImICIT3nB0zQ=="],
+
+    "zod": ["zod@4.6.5", "", {}, "sha512-v5l/aFXZQeai4awLbOpSoHecE9UiMrnfx75tEXLjNonXVARxQ5mOeipTjROUchszUNCqnE+hqAMujRsRHsut2Q=="],
+  }
+}

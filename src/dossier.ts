@@ -1,0 +1,426 @@
+import { ApiError, type ClickUp } from './clickup-api'
+import { DEADLINE_ERROR, realClock, type Clock, type Deadline } from './deadline'
+
+export const TASK_CAP_NOTE = 'Stopped after 60 tasks'
+export const TIME_NOTE = 'Stopped early to stay within time; some items are missing.'
+export const COMMENT_CAP_NOTE = 'Showing the newest 200 comments'
+
+const COMMENT_PAGE_SIZE = 25
+const COMMENT_CAP = 200
+const DOSSIER_STOP_MS = 5000
+const TASK_URL_PATTERN = /app\.clickup\.com\/t\/(?:[a-z0-9]+\/)?([a-z0-9]+)/g
+
+export type DossierOptions = { maxDepth?: number; maxTasks?: number; clock?: Clock }
+
+export type DossierResult = { markdown: string; tasksFetched: number; truncated: boolean }
+
+type CustomField = {
+  name?: string
+  value?: unknown
+  type_config?: { options?: Array<{ id?: string; name?: string }> }
+}
+
+type ClickUpDependency = string | number | { task_id?: string; depends_on?: string }
+
+type ClickUpTask = {
+  id: string
+  name: string
+  description?: string
+  text_content?: string
+  status?: { status?: string }
+  assignees?: Array<{ username?: string }>
+  tags?: Array<{ name?: string }>
+  space?: { name?: string }
+  folder?: { name?: string; hidden?: boolean }
+  list?: { name?: string }
+  custom_fields?: CustomField[]
+  dependencies?: ClickUpDependency[]
+  linked_tasks?: Array<{ task_id?: string }>
+  attachments?: Array<{ title?: string; url?: string }>
+  subtasks?: Array<{ id: string }>
+}
+
+type Comment = {
+  id: string
+  comment_text?: string
+  user?: { username?: string }
+  date?: number | string
+  reply_count?: number | string
+  replies?: Comment[]
+}
+
+type DossierNode = { task: ClickUpTask; children: DossierNode[]; comments: Comment[]; hitCommentCap?: boolean }
+
+type RefEntry = { id: string; relation: string; mentionSource?: string; task?: ClickUpTask; unreachable?: boolean }
+
+export async function buildDossier(
+  api: ClickUp,
+  taskId: string,
+  options: DossierOptions = {},
+  deadline: Deadline,
+): Promise<DossierResult> {
+  const walk = new DossierWalk(api, deadline, options)
+  return walk.run(taskId)
+}
+
+class DossierWalk {
+  private readonly nodes: DossierNode[] = []
+  private readonly refs: RefEntry[] = []
+  private readonly notes: string[] = []
+  private readonly visited = new Set<string>()
+  private readonly maxDepth: number
+  private readonly maxTasks: number
+  private tasksFetched = 0
+  private truncated = false
+
+  constructor(
+    private readonly api: ClickUp,
+    private readonly deadline: Deadline,
+    private readonly options: DossierOptions,
+  ) {
+    this.maxDepth = options.maxDepth ?? 3
+    this.maxTasks = options.maxTasks ?? 60
+  }
+
+  async run(taskId: string): Promise<DossierResult> {
+    const rootTask = await this.fetchTask(taskId)
+    const root: DossierNode = { task: rootTask, children: [], comments: [] }
+    this.nodes.push(root)
+    await this.loadComments(root)
+    await this.walkSubtasks(root, 1)
+    this.collectRefs()
+    await this.fetchRefs()
+    return {
+      markdown: render(root, {
+        notes: this.notes,
+        nodes: this.nodes,
+        refs: this.refs,
+        truncated: this.truncated,
+        clock: this.options.clock,
+      }),
+      tasksFetched: this.tasksFetched,
+      truncated: this.truncated,
+    }
+  }
+
+  private async fetchTask(id: string): Promise<ClickUpTask> {
+    const task = (await this.api.get(`/task/${id}?include_subtasks=true`, this.deadline, this.budgetGuard)) as ClickUpTask
+    this.tasksFetched += 1
+    this.visited.add(id)
+    return task
+  }
+
+  private outOfTime(): boolean {
+    return this.deadline.expired() || this.deadline.remaining() < DOSSIER_STOP_MS
+  }
+
+  private stopForTime(): boolean {
+    if (!this.outOfTime()) return false
+    this.truncated = true
+    return true
+  }
+
+  private readonly budgetGuard = (): void => {
+    if (this.outOfTime()) throw new Error(DEADLINE_ERROR)
+  }
+
+  private isDeadlineFailure(error: unknown): boolean {
+    return error instanceof Error && error.message === DEADLINE_ERROR
+  }
+
+  private noteCap(): void {
+    if (!this.notes.includes(TASK_CAP_NOTE)) this.notes.push(TASK_CAP_NOTE)
+  }
+
+  private async loadComments(node: DossierNode): Promise<void> {
+    if (this.stopForTime()) return
+    const loaded = await this.fetchComments(node.task.id)
+    node.comments = loaded.comments
+    node.hitCommentCap = loaded.hitCap
+    await this.attachReplies(node)
+  }
+
+  private async fetchComments(id: string): Promise<{ comments: Comment[]; hitCap: boolean }> {
+    const collected: Comment[] = []
+    let start: string | undefined
+    let startId: string | undefined
+    let stoppedAtCap = false
+    for (;;) {
+      if (this.stopForTime()) break
+      const query = start === undefined ? '' : `?start=${encodeURIComponent(start)}&start_id=${startId}`
+      let page: Comment[]
+      try {
+        const body = (await this.api.get(`/task/${id}/comment${query}`, this.deadline, this.budgetGuard)) as { comments?: Comment[] }
+        page = body.comments ?? []
+      } catch (error) {
+        if (!this.isDeadlineFailure(error)) throw error
+        this.truncated = true
+        break
+      }
+      collected.push(...page)
+      stoppedAtCap = page.length >= COMMENT_PAGE_SIZE && collected.length >= COMMENT_CAP
+      if (page.length < COMMENT_PAGE_SIZE || collected.length >= COMMENT_CAP) break
+      const oldest = page[page.length - 1]
+      start = String(oldest.date ?? '')
+      startId = String(oldest.id)
+    }
+    return { comments: collected.slice(0, COMMENT_CAP), hitCap: stoppedAtCap }
+  }
+
+  private async attachReplies(node: DossierNode): Promise<void> {
+    const threads = node.comments.filter((comment) => Number(comment.reply_count ?? 0) > 0)
+    const settled = await Promise.allSettled(
+      threads.map(async (comment) => {
+        if (this.stopForTime()) return { comment, replies: [] as Comment[] }
+        const body = (await this.api.get(`/comment/${comment.id}/reply`, this.deadline, this.budgetGuard)) as { comments?: Comment[] }
+        return { comment, replies: body.comments ?? [] }
+      }),
+    )
+    for (const outcome of settled) {
+      if (outcome.status === 'fulfilled') {
+        outcome.value.comment.replies = outcome.value.replies
+        continue
+      }
+      if (this.isDeadlineFailure(outcome.reason)) {
+        this.truncated = true
+        continue
+      }
+      throw outcome.reason
+    }
+  }
+
+  private async walkSubtasks(node: DossierNode, depth: number): Promise<void> {
+    for (const subtask of node.task.subtasks ?? []) {
+      if (this.stopForTime()) return
+      if (this.visited.has(subtask.id)) continue
+      if (this.tasksFetched >= this.maxTasks) {
+        this.noteCap()
+        return
+      }
+      let task: ClickUpTask
+      try {
+        task = await this.fetchTask(subtask.id)
+      } catch (error) {
+        if (this.isDeadlineFailure(error)) {
+          this.truncated = true
+          return
+        }
+        throw error
+      }
+      const child: DossierNode = { task, children: [], comments: [] }
+      node.children.push(child)
+      this.nodes.push(child)
+      await this.loadComments(child)
+      if (depth < this.maxDepth) await this.walkSubtasks(child, depth + 1)
+    }
+  }
+
+  private collectRefs(): void {
+    const seen = new Set<string>()
+    const add = (entry: RefEntry) => {
+      if (seen.has(entry.id) || this.visited.has(entry.id)) return
+      seen.add(entry.id)
+      this.refs.push(entry)
+    }
+    for (const node of this.nodes) {
+      for (const target of dependencyTargets(node.task)) add({ id: target, relation: 'Depends on' })
+      for (const linked of node.task.linked_tasks ?? []) {
+        if (linked.task_id) add({ id: linked.task_id, relation: 'Linked' })
+      }
+      for (const text of textOf(node)) {
+        for (const match of text.matchAll(TASK_URL_PATTERN)) {
+          if (match[1]) add({ id: match[1], relation: 'Mentioned', mentionSource: node.task.name })
+        }
+      }
+    }
+  }
+
+  private async fetchRefs(): Promise<void> {
+    for (const ref of this.refs) {
+      if (this.stopForTime()) return
+      if (this.tasksFetched >= this.maxTasks) {
+        this.noteCap()
+        return
+      }
+      try {
+        ref.task = await this.fetchTask(ref.id)
+      } catch (error) {
+        if (this.isDeadlineFailure(error)) {
+          this.truncated = true
+          return
+        }
+        if (error instanceof ApiError && error.status === 404) {
+          ref.unreachable = true
+          continue
+        }
+        throw error
+      }
+    }
+  }
+}
+
+function dependencyTargets(task: ClickUpTask): string[] {
+  return (task.dependencies ?? [])
+    .map((entry) => relatedDependencyId(entry, task.id))
+    .filter((id): id is string => id !== null)
+}
+
+function relatedDependencyId(entry: ClickUpDependency, ownId: string): string | null {
+  if (entry === null || entry === undefined) return null
+  if (typeof entry !== 'object') return String(entry)
+  if (entry.depends_on && entry.depends_on !== ownId) return entry.depends_on
+  if (entry.task_id && entry.task_id !== ownId) return entry.task_id
+  return null
+}
+
+function textOf(node: DossierNode): string[] {
+  const body = node.task.text_content || node.task.description || ''
+  const comments = node.comments.flatMap((comment) => [
+    comment.comment_text ?? '',
+    ...(comment.replies ?? []).map((reply) => reply.comment_text ?? ''),
+  ])
+  return [body, ...comments]
+}
+
+function render(
+  root: DossierNode,
+  context: { notes: string[]; nodes: DossierNode[]; refs: RefEntry[]; truncated: boolean; clock?: Clock },
+): string {
+  const lines: string[] = []
+  const clock = context.clock ?? realClock
+  lines.push(`# Dossier: ${root.task.name} (${root.task.id})`, '')
+  lines.push('## Summary', ...summaryLines(root.task), '')
+  lines.push('## Description')
+  appendBody(lines, root.task.text_content || root.task.description || '')
+  lines.push('')
+  lines.push('## Fields', ...fieldLines(root.task), '')
+  lines.push('## Subtasks', ...subtaskLines(root), '')
+  lines.push('## Comments', ...commentLines(context.nodes), '')
+  lines.push('## Dependencies and links', ...refLines(context.refs), '')
+  lines.push('## Attachments', ...attachmentLines(context.nodes, context.refs))
+  lines.push('')
+  if (context.truncated) lines.push(TIME_NOTE)
+  lines.push(...context.notes)
+  lines.push(`Gathered at ${new Date(clock.now()).toISOString()} from ClickUp`)
+  return lines.join('\n')
+}
+
+function summaryLines(task: ClickUpTask): string[] {
+  const lines: string[] = []
+  if (task.status?.status) lines.push(`Status: ${task.status.status}`)
+  const path = [
+    task.space?.name,
+    task.folder && !task.folder.hidden ? task.folder.name : undefined,
+    task.list?.name,
+  ]
+    .filter((part): part is string => Boolean(part))
+    .join(' / ')
+  if (path) lines.push(`Path: ${path}`)
+  const assignees = (task.assignees ?? []).map((a) => a.username).filter(Boolean).join(', ')
+  if (assignees) lines.push(`Assignees: ${assignees}`)
+  const tags = (task.tags ?? []).map((tag) => tag.name).filter(Boolean).join(', ')
+  if (tags) lines.push(`Tags: ${tags}`)
+  lines.push(`URL: https://app.clickup.com/t/${task.id}`)
+  return lines
+}
+
+function appendBody(lines: string[], body: string): void {
+  for (const line of body.split('\n')) {
+    if (line.trim()) lines.push(line.trim())
+  }
+}
+
+function fieldLines(task: ClickUpTask): string[] {
+  const lines: string[] = []
+  for (const field of task.custom_fields ?? []) {
+    const value = customFieldValue(field)
+    if (value !== null) lines.push(`- ${field.name}: ${value}`)
+  }
+  return lines
+}
+
+function customFieldValue(field: CustomField): string | null {
+  const value = field.value
+  if (value === null || value === undefined || value === '') return null
+  if (Array.isArray(value)) {
+    const items = value
+      .map((item) =>
+        typeof item === 'object' && item !== null
+          ? String((item as { label?: string; name?: string }).label ?? (item as { name?: string }).name ?? '')
+          : String(item),
+      )
+      .filter(Boolean)
+    return items.length > 0 ? items.join(', ') : null
+  }
+  const options = field.type_config?.options ?? []
+  const matched = options.find((option) => option.id !== undefined && String(option.id) === String(value))
+  return matched?.name ?? String(value)
+}
+
+function subtaskLines(root: DossierNode): string[] {
+  const lines: string[] = []
+  const walk = (children: DossierNode[], depth: number) => {
+    for (const child of children) {
+      const indent = '  '.repeat(depth)
+      lines.push(`${indent}- **${child.task.name}** (${child.task.id}) — ${child.task.status?.status ?? ''}`)
+      const body = child.task.text_content || child.task.description || ''
+      for (const line of body.split('\n')) {
+        if (line.trim()) lines.push(`${indent}  ${line.trim()}`)
+      }
+      walk(child.children, depth + 1)
+    }
+  }
+  walk(root.children, 0)
+  return lines
+}
+
+function dayOf(date: number | string | undefined): string {
+  const milliseconds = Number(date)
+  if (!date || !Number.isFinite(milliseconds) || milliseconds <= 0) return ''
+  return new Date(milliseconds).toISOString().slice(0, 10)
+}
+
+function commentLines(nodes: DossierNode[]): string[] {
+  const lines: string[] = []
+  for (const node of nodes) {
+    if (node.comments.length === 0) continue
+    lines.push(`### ${node.task.name} (${node.task.id})`)
+    if (node.hitCommentCap) lines.push(COMMENT_CAP_NOTE)
+    for (const comment of node.comments) {
+      const author = comment.user?.username ?? 'someone'
+      lines.push(`- **${author}** (${dayOf(comment.date)}): ${(comment.comment_text ?? '').trim()}`)
+      for (const reply of comment.replies ?? []) {
+        lines.push(`  - **${reply.user?.username ?? 'someone'}** (${dayOf(reply.date)}): ${(reply.comment_text ?? '').trim()}`)
+      }
+    }
+  }
+  return lines
+}
+
+function refLines(refs: RefEntry[]): string[] {
+  const lines: string[] = []
+  for (const ref of refs) {
+    if (ref.unreachable) {
+      lines.push(`- ${ref.relation}: ${ref.id} (could not fetch)`)
+      continue
+    }
+    if (!ref.task) continue
+    const where = ref.mentionSource ? ` in "${ref.mentionSource}"` : ''
+    lines.push(`- ${ref.relation}${where}: **${ref.task.name}** (${ref.task.id}) — ${ref.task.status?.status ?? ''}`)
+  }
+  return lines
+}
+
+function attachmentLines(nodes: DossierNode[], refs: RefEntry[]): string[] {
+  const seen = new Set<string>()
+  const lines: string[] = []
+  const tasks = [...nodes.map((node) => node.task), ...refs.flatMap((ref) => (ref.task ? [ref.task] : []))]
+  for (const task of tasks) {
+    for (const attachment of task.attachments ?? []) {
+      if (!attachment.url || seen.has(attachment.url)) continue
+      seen.add(attachment.url)
+      lines.push(`- [${attachment.title ?? attachment.url}](${attachment.url})`)
+    }
+  }
+  return lines
+}

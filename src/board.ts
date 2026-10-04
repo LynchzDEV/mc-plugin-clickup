@@ -1,0 +1,156 @@
+import { ApiError, TokenRejected, type ClickUp } from './clickup-api'
+import type { Deadline } from './deadline'
+
+const MAX_PAGES = 100
+const LIST_PAGE_SIZE = 100
+
+export type BoardSource = { kind: 'list'; listId: string } | { kind: 'view'; viewId: string; listId: string }
+
+export type Board = { id: string; name: string; folder: string; source: BoardSource }
+
+export type Card = {
+  id: string
+  name: string
+  url: string
+  status: string
+  tags: string[]
+  assignees: Array<{ initials: string; color: string }>
+  subtaskCount: number
+  commentCount?: number
+}
+
+export type Column = { status: string; color: string; tasks: Card[] }
+
+export type LoadedBoard = { columns: Column[]; partialFilters: boolean }
+
+type StatusRecord = { status: string; orderindex?: number | string; color?: string }
+
+export type ListDetail = {
+  id: string
+  name: string
+  statuses?: StatusRecord[]
+  space?: { name?: string }
+  folder?: { name?: string; hidden?: boolean }
+}
+
+type TaskRecord = {
+  id: string
+  name?: string
+  url?: string
+  status?: { status?: string }
+  tags?: Array<{ name?: string }>
+  assignees?: Array<{ username?: string; color?: string }>
+  subtask_count?: number | string
+  comment_count?: number | string
+}
+
+export async function fetchListDetail(api: ClickUp, listId: string, deadline: Deadline): Promise<ListDetail> {
+  return (await api.get(`/list/${listId}`, deadline)) as ListDetail
+}
+
+export function listPath(list: ListDetail): string {
+  const parts = [
+    list.space?.name,
+    list.folder && !list.folder.hidden ? list.folder.name : undefined,
+    list.name,
+  ].filter((part): part is string => Boolean(part))
+  return parts.join(' / ')
+}
+
+export async function loadBoard(api: ClickUp, board: Board, deadline: Deadline): Promise<LoadedBoard> {
+  try {
+    return await boardColumns(api, board, deadline)
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) throw new Error("This board's list is gone")
+    throw error
+  }
+}
+
+async function boardColumns(api: ClickUp, board: Board, deadline: Deadline): Promise<LoadedBoard> {
+  const list = await fetchListDetail(api, board.source.listId, deadline)
+  const columns = [...(list.statuses ?? [])]
+    .sort((a, b) => Number(a.orderindex ?? 0) - Number(b.orderindex ?? 0))
+    .map((status) => ({ status: status.status, color: status.color ?? '', tasks: [] as Card[] }))
+  const byStatus = new Map(columns.map((column) => [column.status, column]))
+  const extraColumns: Column[] = []
+  const { tasks, partialFilters } = await fetchTasks(api, board, deadline)
+  for (const task of tasks) {
+    const card = toCard(task)
+    const column = byStatus.get(card.status)
+    if (column) {
+      column.tasks.push(card)
+      continue
+    }
+    const extra = extraColumns.find((candidate) => candidate.status === card.status)
+    if (extra) extra.tasks.push(card)
+    else extraColumns.push({ status: card.status, color: '', tasks: [card] })
+  }
+  return { columns: [...columns, ...extraColumns], partialFilters }
+}
+
+async function fetchTasks(api: ClickUp, board: Board, deadline: Deadline): Promise<{ tasks: TaskRecord[]; partialFilters: boolean }> {
+  if (board.source.kind === 'view') {
+    try {
+      return { tasks: await viewTasks(api, board.source.viewId, deadline), partialFilters: false }
+    } catch (error) {
+      if (!isViewRefusal(error)) throw error
+    }
+  }
+  return { tasks: await listTasks(api, board.source.listId, deadline), partialFilters: board.source.kind === 'view' }
+}
+
+function isViewRefusal(error: unknown): boolean {
+  if (error instanceof TokenRejected) return true
+  return error instanceof ApiError && (error.status === 403 || error.status === 404)
+}
+
+async function viewTasks(api: ClickUp, viewId: string, deadline: Deadline): Promise<TaskRecord[]> {
+  const tasks: TaskRecord[] = []
+  for (let page = 0; page <= MAX_PAGES; page++) {
+    const body = (await api.get(`/view/${viewId}/task?page=${page}`, deadline)) as {
+      tasks?: TaskRecord[]
+      last_page?: boolean
+    }
+    const pageTasks = body.tasks ?? []
+    tasks.push(...pageTasks)
+    if (body.last_page !== false || pageTasks.length === 0) break
+  }
+  return tasks
+}
+
+async function listTasks(api: ClickUp, listId: string, deadline: Deadline): Promise<TaskRecord[]> {
+  const tasks: TaskRecord[] = []
+  for (let page = 0; page <= MAX_PAGES; page++) {
+    const body = (await api.get(`/list/${listId}/task?page=${page}&subtasks=false`, deadline)) as { tasks?: TaskRecord[] }
+    const pageTasks = body.tasks ?? []
+    tasks.push(...pageTasks)
+    if (pageTasks.length < LIST_PAGE_SIZE) break
+  }
+  return tasks
+}
+
+function toCard(task: TaskRecord): Card {
+  return {
+    id: String(task.id),
+    name: task.name ?? '',
+    url: task.url ?? `https://app.clickup.com/t/${task.id}`,
+    status: task.status?.status ?? '',
+    tags: (task.tags ?? []).map((tag) => tag.name ?? ''),
+    assignees: (task.assignees ?? []).map((assignee) => ({
+      initials: initialsOf(assignee.username ?? ''),
+      color: assignee.color ?? '',
+    })),
+    subtaskCount: Number(task.subtask_count ?? 0),
+    commentCount: task.comment_count === undefined ? undefined : Number(task.comment_count),
+  }
+}
+
+function initialsOf(username: string): string {
+  return username
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => word[0])
+    .slice(0, 2)
+    .join('')
+    .toUpperCase()
+}

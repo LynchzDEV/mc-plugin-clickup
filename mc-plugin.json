@@ -1,0 +1,19 @@
+{
+  "id": "clickup-board",
+  "name": "ClickUp board",
+  "version": "1.0.0",
+  "description": "See a ClickUp board and start a chat or terminal on any task.",
+  "pluginApi": 1,
+  "runtime": "isolated",
+  "icon": "assets/icon.svg",
+  "server": "src/server.ts",
+  "screen": "src/screen.ts",
+  "permissions": {
+    "network": ["api.clickup.com"],
+    "sessions": ["chat", "terminal"],
+    "settings": true
+  },
+  "settings": [
+    { "key": "token", "label": "ClickUp token", "type": "secret", "help": "ClickUp, Settings, Apps, Generate." }
+  ]
+}

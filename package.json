@@ -1,0 +1,9 @@
+{
+  "name": "mc-plugin-clickup",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@mission-control/plugin-sdk": "github:LynchzDEV/mc-plugin-sdk#v0.1.0"
+  }
+}
