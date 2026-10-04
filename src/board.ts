@@ -3,6 +3,7 @@ import type { Deadline } from './deadline'
 
 const MAX_PAGES = 100
 const LIST_PAGE_SIZE = 100
+const PAGE_WAVE = 4
 
 export type BoardSource = { kind: 'list'; listId: string } | { kind: 'view'; viewId: string; listId: string }
 
@@ -104,29 +105,35 @@ function isViewRefusal(error: unknown): boolean {
   return error instanceof ApiError && (error.status === 403 || error.status === 404)
 }
 
-async function viewTasks(api: ClickUp, viewId: string, deadline: Deadline): Promise<TaskRecord[]> {
+type TaskPage = { tasks: TaskRecord[]; last: boolean }
+
+async function pagedTasks(fetchPage: (page: number) => Promise<TaskPage>): Promise<TaskRecord[]> {
   const tasks: TaskRecord[] = []
-  for (let page = 0; page <= MAX_PAGES; page++) {
-    const body = (await api.get(`/view/${viewId}/task?page=${page}`, deadline)) as {
-      tasks?: TaskRecord[]
-      last_page?: boolean
+  for (let start = 0; start <= MAX_PAGES; start += PAGE_WAVE) {
+    const count = Math.min(PAGE_WAVE, MAX_PAGES + 1 - start)
+    const pages = await Promise.all(Array.from({ length: count }, (_, offset) => fetchPage(start + offset)))
+    for (const page of pages) {
+      tasks.push(...page.tasks)
+      if (page.last) return tasks
     }
-    const pageTasks = body.tasks ?? []
-    tasks.push(...pageTasks)
-    if (body.last_page !== false || pageTasks.length === 0) break
   }
   return tasks
 }
 
+async function viewTasks(api: ClickUp, viewId: string, deadline: Deadline): Promise<TaskRecord[]> {
+  return pagedTasks(async page => {
+    const body = (await api.get(`/view/${viewId}/task?page=${page}`, deadline)) as { tasks?: TaskRecord[]; last_page?: boolean }
+    const tasks = body.tasks ?? []
+    return { tasks, last: body.last_page !== false || tasks.length === 0 }
+  })
+}
+
 async function listTasks(api: ClickUp, listId: string, deadline: Deadline): Promise<TaskRecord[]> {
-  const tasks: TaskRecord[] = []
-  for (let page = 0; page <= MAX_PAGES; page++) {
+  return pagedTasks(async page => {
     const body = (await api.get(`/list/${listId}/task?page=${page}&subtasks=false`, deadline)) as { tasks?: TaskRecord[] }
-    const pageTasks = body.tasks ?? []
-    tasks.push(...pageTasks)
-    if (pageTasks.length < LIST_PAGE_SIZE) break
-  }
-  return tasks
+    const tasks = body.tasks ?? []
+    return { tasks, last: tasks.length < LIST_PAGE_SIZE }
+  })
 }
 
 function toCard(task: TaskRecord): Card {

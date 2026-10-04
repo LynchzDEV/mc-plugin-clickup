@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { ServerContext } from '@mission-control/plugin-sdk'
 import { createMethods } from '../src/server'
 import { TIME_NOTE } from '../src/dossier'
@@ -15,7 +18,7 @@ function makeCtx(settings: Record<string, string> = {}) {
         else store.set(key, value)
       },
     },
-    data: '/tmp/mc-plugin-clickup-test',
+    data: mkdtempSync(join(tmpdir(), 'mc-plugin-clickup-')),
     log: () => {},
   }
   return { ctx, store }
@@ -269,6 +272,25 @@ describe('board.load', () => {
     expect(result.partialFilters).toBe(false)
     expect(result.columns[0].tasks[0]).toMatchObject({ id: 't1', name: 'One', status: 'Open' })
     expect(result.loadedAt).toBe('1970-01-01T00:00:00.000Z')
+  })
+
+  test('the last load is kept so the next open shows it at once, and removing the board drops it', async () => {
+    const { methods, clock } = tokened(({ path }) => {
+      if (path === '/list/li1') return { body: listDetail }
+      if (path === '/list/li1/task') return { body: { tasks: [{ id: 't1', name: 'One', status: { status: 'Open' } }] } }
+      return { status: 404, body: {} }
+    })
+    const { ctx, store } = makeCtx({ token: 'pk_server', boards: JSON.stringify([boardFixture]) })
+    expect(await methods['board.cached']({ boardId: boardFixture.id }, ctx)).toBeNull()
+    const loaded = await call(clock, methods['board.load']({ boardId: boardFixture.id }, ctx))
+    for (let tries = 0; tries < 200 && (await methods['board.cached']({ boardId: boardFixture.id }, ctx)) === null; tries++) await new Promise(resolve => setImmediate(resolve))
+    const renamed = { ...boardFixture, folder: '~/elsewhere' }
+    store.set('boards', JSON.stringify([renamed]))
+    const cached = await methods['board.cached']({ boardId: boardFixture.id }, ctx)
+    expect(cached).toEqual({ ...JSON.parse(JSON.stringify(loaded)), board: renamed })
+    await methods['boards.remove']({ id: boardFixture.id }, ctx)
+    store.set('boards', JSON.stringify([renamed]))
+    expect(await methods['board.cached']({ boardId: boardFixture.id }, ctx)).toBeNull()
   })
 
   test('an unknown board id says it was removed', async () => {

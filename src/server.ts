@@ -3,6 +3,7 @@ import type { ServerContext } from '@mission-control/plugin-sdk'
 import { createClickUp, type ClickUp } from './clickup-api'
 import { createDeadline, realClock, type Clock, type Deadline } from './deadline'
 import { fetchListDetail, listPath, loadBoard, type Board, type BoardSource } from './board'
+import { dropCachedBoard, readCachedBoard, writeCachedBoard } from './board-cache'
 import { buildDossier } from './dossier'
 import { treeChildren, type TreeNode } from './tree'
 import { parseClickUpLink } from './links'
@@ -121,7 +122,15 @@ export function createMethods(deps: PluginDeps = {}) {
     'boards.remove': async (params: { id: string }, ctx: ServerContext) => {
       const boards = await readBoards(ctx)
       await writeBoards(ctx, boards.filter((board) => board.id !== params.id))
+      await dropCachedBoard(ctx.data, params.id)
       return { ok: true }
+    },
+
+    'board.cached': async (params: { boardId: string }, ctx: ServerContext) => {
+      const board = (await readBoards(ctx)).find((candidate) => candidate.id === params.boardId)
+      if (!board) return null
+      const cached = await readCachedBoard<Record<string, unknown>>(ctx.data, board.id)
+      return cached === null ? null : { ...cached, board }
     },
 
     'board.load': async (params: { boardId: string }, ctx: ServerContext) =>
@@ -130,7 +139,9 @@ export function createMethods(deps: PluginDeps = {}) {
         const board = boards.find((candidate) => candidate.id === params.boardId)
         if (!board) throw new Error('This board was removed')
         const loaded = await loadBoard(api, board, deadline)
-        return { board, ...loaded, loadedAt: new Date(clock.now()).toISOString() }
+        const result = { board, ...loaded, loadedAt: new Date(clock.now()).toISOString() }
+        void writeCachedBoard(ctx.data, board.id, result).catch((error) => ctx.log(`board cache not saved: ${String(error)}`))
+        return result
       }),
 
     'task.dossier': async (params: { taskId: string }, ctx: ServerContext) =>

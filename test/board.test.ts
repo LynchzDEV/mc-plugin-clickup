@@ -77,7 +77,7 @@ describe('loadBoard', () => {
       viewBoard,
     )
     const viewCalls = fake.calls.filter((call) => call.path === '/view/vw1/task')
-    expect(viewCalls.map((call) => call.query.get('page'))).toEqual(['0', '1'])
+    expect(viewCalls.map((call) => call.query.get('page'))).toEqual(['0', '1', '2', '3'])
     expect(result.partialFilters).toBe(false)
     expect(result.columns.flatMap((column) => column.tasks).map((card) => card.id)).toEqual(['a', 'b', 'c'])
   })
@@ -97,9 +97,26 @@ describe('loadBoard', () => {
       listBoard,
     )
     const taskCalls = fake.calls.filter((call) => call.path === '/list/li1/task')
-    expect(taskCalls.length).toBe(2)
     expect(taskCalls[0].query.get('subtasks')).toBe('false')
-    expect(taskCalls.map((call) => call.query.get('page'))).toEqual(['0', '1'])
+    expect(taskCalls.map((call) => call.query.get('page'))).toEqual(['0', '1', '2', '3'])
+  })
+
+  test('ten view pages arrive in waves of four, in page order', async () => {
+    const { result, fake } = await load(
+      ({ path, query }) => {
+        if (path === '/list/li1') return { body: listDetail }
+        if (path === '/view/vw1/task') {
+          const page = Number(query.get('page'))
+          return { body: { tasks: page < 10 ? [task(`t${page}`)] : [], last_page: page >= 9 }, delay: 1000 }
+        }
+        return { status: 404, body: {} }
+      },
+      viewBoard,
+    )
+    const pages = fake.calls.filter((call) => call.path === '/view/vw1/task').map((call) => Number(call.query.get('page')))
+    expect(pages).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+    expect(fake.maxInFlight()).toBeLessThanOrEqual(4)
+    expect(result.columns.flatMap((column) => column.tasks).map((card) => card.id)).toEqual(['t0', 't1', 't2', 't3', 't4', 't5', 't6', 't7', 't8', 't9'])
   })
 
   for (const status of [401, 403, 404]) {

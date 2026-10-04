@@ -102,14 +102,30 @@ async function mountScreen(root: HTMLElement, mc: ScreenApi): Promise<void> {
     await loadBoard()
   }
 
-  async function loadBoard(): Promise<void> {
-    retry = loadBoard
+  function markRefreshing(): void {
     const refresh = shell.querySelector<HTMLButtonElement>('[data-act="refresh"]')
     if (refresh) {
       refresh.disabled = true
       refresh.textContent = 'Refreshing…'
     }
+  }
+
+  async function loadBoard(): Promise<void> {
+    retry = loadBoard
     const seq = ++loadSeq
+    if (loaded?.board.id !== boardId) loaded = null
+    mode = 'board'
+    paint()
+    markRefreshing()
+    if (loaded === null) {
+      const cached = (await mc.call('board.cached', { boardId: boardId ?? '' }).catch(() => null)) as Loaded | null
+      if (seq !== loadSeq) return
+      if (cached !== null && loaded === null) {
+        loaded = cached
+        paint()
+        markRefreshing()
+      }
+    }
     try {
       const result = (await mc.call('board.load', { boardId: boardId ?? '' })) as Loaded
       if (seq !== loadSeq) return

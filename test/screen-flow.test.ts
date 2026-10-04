@@ -22,6 +22,7 @@ type Script = {
   dossier?: (taskId: string) => DossierResult | Promise<DossierResult>
   resolve?: (url: string) => ResolvedLink | Promise<ResolvedLink>
   loadGate?: (boardId: string) => Promise<void>
+  cached?: (boardId: string) => unknown
   tree?: (node: TreeNode) => TreeChild[] | Promise<TreeChild[]>
 }
 
@@ -81,6 +82,7 @@ function makeMc(script: Script) {
             if (index >= 0) boards.splice(index, 1)
             return { ok: true }
           }
+          if (method === 'board.cached') return script.cached ? script.cached((params as { boardId: string }).boardId) : null
           if (method === 'board.load') {
             if (script.loadError) throw script.loadError
             const boardId = (params as { boardId: string }).boardId
@@ -282,7 +284,7 @@ describe('saved board', () => {
     script.removeError = undefined
     button(root, 'Retry').click()
     await settle(inflight)
-    expect(calls.slice(before).map((call) => call.method)).toEqual(['boards.remove', 'boards.list', 'board.load'])
+    expect(calls.slice(before).map((call) => call.method)).toEqual(['boards.remove', 'boards.list', 'board.cached', 'board.load'])
     expect(root.textContent).toContain('Backoffice bugs')
   })
 
@@ -592,5 +594,43 @@ describe('out-of-order responses', () => {
     expect(root.querySelector('.mk-dialog')).toBeNull()
     expect(root.textContent).not.toContain('Late list')
     expect(root.textContent).toContain('Pick your first board')
+  })
+})
+
+describe('opening a board', () => {
+  const columns: Column[] = [{ status: 'In progress', color: '#4a8fe0', tasks: [card()] }]
+
+  test('shows Loading board right away instead of a blank frame', async () => {
+    let release: () => void = () => {}
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const fake = makeMc({ tokenConfigured: true, boards: [board], loadColumns: columns, loadGate: () => gate })
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    void definition.mount(root, fake.mc)
+    for (let i = 0; i < 20 && !root.textContent!.includes('Loading board'); i++) await Promise.resolve()
+    expect(root.textContent).toContain('Loading board…')
+    release()
+    await settle(fake.inflight)
+    expect(root.textContent).toContain('HerMEZ kood queue stalls after deploy')
+  })
+
+  test('the last loaded board shows at once while a fresh load runs', async () => {
+    let release: () => void = () => {}
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const cachedCard = card({ id: 'old1', name: 'From the last visit' })
+    const fake = makeMc({
+      tokenConfigured: true, boards: [board], loadColumns: columns, loadGate: () => gate,
+      cached: () => ({ board, columns: [{ status: 'To do', color: '#87909e', tasks: [cachedCard] }], partialFilters: false, loadedAt: new Date(Date.now() - 5 * 60_000).toISOString() }),
+    })
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    void definition.mount(root, fake.mc)
+    for (let i = 0; i < 50 && !root.textContent!.includes('From the last visit'); i++) await Promise.resolve()
+    expect(root.textContent).toContain('From the last visit')
+    expect(root.querySelector('[data-act="refresh"]')?.textContent).toBe('Refreshing…')
+    release()
+    await settle(fake.inflight)
+    expect(root.textContent).not.toContain('From the last visit')
+    expect(root.textContent).toContain('HerMEZ kood queue stalls after deploy')
   })
 })
