@@ -1,4 +1,5 @@
-import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { randomBytes } from 'node:crypto'
+import { mkdir, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { Clock, Deadline } from './deadline'
 
@@ -9,10 +10,11 @@ export const MAX_IMAGE_BYTES = 3_932_160
 
 const IMAGE_HOST_SUFFIX = '.clickup-attachments.com'
 const REPLIES_FOLDER = 'replies'
+const PART_SUFFIX = '.part'
 const EXTENSION_BY_TYPE: Record<string, string> = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' }
 
 export type SavedImage = { name: string; path: string }
-export type ImageStore = { data: string; fetch: typeof fetch; clock: Clock }
+export type ImageStore = { data: string; fetch: typeof fetch; clock: Clock; log: (message: string) => void }
 export type DownloadedImage = { url: string; image: SavedImage }
 
 export function isAttachmentUrl(url: string): boolean {
@@ -79,9 +81,16 @@ async function saveImage(store: ImageStore, stem: string, bytes: Uint8Array, ext
   const name = `${stem}.${extension}`
   const path = `${REPLIES_FOLDER}/${name}`
   const file = join(store.data, path)
-  await mkdir(join(store.data, REPLIES_FOLDER), { recursive: true })
-  await rm(file, { force: true })
-  await writeFile(file, bytes, { flag: 'wx' })
+  const folder = join(store.data, REPLIES_FOLDER)
+  const part = join(folder, `.${name}.${randomBytes(8).toString('hex')}${PART_SUFFIX}`)
+  await mkdir(folder, { recursive: true })
+  try {
+    await writeFile(part, bytes, { flag: 'wx' })
+    await rename(part, file)
+  } catch (error) {
+    await rm(part, { force: true })
+    throw error
+  }
   return { name, path }
 }
 

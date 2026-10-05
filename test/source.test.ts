@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from 'bun:test'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createClickUp } from '../src/clickup-api'
@@ -134,7 +134,8 @@ function repliesSetup(top: unknown[], threads: Record<string, unknown[]> = {}, i
   const data = mkdtempSync(join(tmpdir(), 'mc-plugin-clickup-replies-'))
   dataDirs.push(data)
   const images = fakeImages(image)
-  return { ...base, data, images, store: { data, fetch: images.fetchImpl, clock: base.clock } }
+  const logs: string[] = []
+  return { ...base, data, images, logs, store: { data, fetch: images.fetchImpl, clock: base.clock, log: (message: string) => void logs.push(message) } }
 }
 
 describe('sourceReplies', () => {
@@ -363,5 +364,50 @@ describe('sourceReplies image downloads', () => {
     const result = await settleWithDisk(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, { ...store, data: '' }))
     expect(images.calls).toHaveLength(0)
     expect(result.replies[0]!.text).toBe(`see\nImage: ${host('a.png')}`)
+  })
+})
+
+const brokenStream = (first: Uint8Array): typeof fetch =>
+  (async () =>
+    new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(first)
+        },
+        pull(controller) {
+          controller.error(new Error('connection reset'))
+        },
+      }),
+      { headers: { 'content-type': 'image/png' } },
+    )) as unknown as typeof fetch
+
+describe('sourceReplies image writes', () => {
+  test('a download that fails mid-stream leaves no final file and no partial file', async () => {
+    const { clock, api, deadline, store, data } = repliesSetup([withImages('6', 600, [host('a.png')])])
+    const result = await settleWithDisk(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, { ...store, fetch: brokenStream(PNG) }))
+    expect(result.replies[0]!.images).toEqual([])
+    expect(result.replies[0]!.text).toBe(`see\nImage: ${host('a.png')}`)
+    expect(existsSync(join(data, 'replies')) ? readdirSync(join(data, 'replies')) : []).toEqual([])
+  })
+
+  test('removes the partial file when the finished image cannot take its final name', async () => {
+    const { clock, api, deadline, store, data } = repliesSetup([withImages('6', 600, [host('a.png')])], {}, () => ({ type: 'image/png', chunks: [PNG] }))
+    mkdirSync(join(data, 'replies', '6-0.png', 'blocker'), { recursive: true })
+    const result = await settleWithDisk(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))
+    expect(result.replies[0]!.images).toEqual([])
+    expect(readdirSync(join(data, 'replies'))).toEqual(['6-0.png'])
+  })
+
+  test('two overlapping checks of the same image both succeed and leave one complete file', async () => {
+    const body = Array.from({ length: 8 }, (_, index) => new Uint8Array(64 * 1024).fill(index))
+    const { clock, api, deadline, store, data } = repliesSetup([withImages('6', 600, [host('a.png')])], {}, () => ({ type: 'image/png', chunks: body }))
+    const both = Promise.all([
+      sourceReplies(api, { id: 't1', sinceId: null }, deadline, store),
+      sourceReplies(api, { id: 't1', sinceId: null }, deadline, store),
+    ])
+    const results = await settleWithDisk(clock, both)
+    expect(results.map((result) => result.replies[0]!.images)).toEqual([[{ name: '6-0.png', path: 'replies/6-0.png' }], [{ name: '6-0.png', path: 'replies/6-0.png' }]])
+    expect(readdirSync(join(data, 'replies'))).toEqual(['6-0.png'])
+    expect(new Uint8Array(readFileSync(join(data, 'replies', '6-0.png')))).toEqual(new Uint8Array(Buffer.concat(body)))
   })
 })
