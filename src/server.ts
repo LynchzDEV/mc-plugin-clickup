@@ -7,6 +7,7 @@ import { dropCachedBoard, readCachedBoard, writeCachedBoard } from './board-cach
 import { buildDossier } from './dossier'
 import { treeChildren, type TreeNode } from './tree'
 import { parseClickUpLink } from './links'
+import { sanitizeGroup } from './filters'
 
 const METHOD_TIMEOUT_MS = 25000
 const BOARD_ID_PATTERN = /^b-[0-9a-f]{8}$/
@@ -51,6 +52,14 @@ function isBoardInputValid(board: { name?: string; folder?: string }): boolean {
 
 export function createMethods(deps: PluginDeps = {}) {
   const clock = deps.clock ?? realClock
+  async function myUserId(api: ClickUp, deadline: Deadline): Promise<string | null> {
+    try {
+      const body = (await api.get('/user', deadline)) as { user?: { id?: number | string } }
+      return body.user?.id === undefined ? null : String(body.user.id)
+    } catch {
+      return null
+    }
+  }
 
   async function withClickUp<T>(
     ctx: ServerContext,
@@ -114,9 +123,20 @@ export function createMethods(deps: PluginDeps = {}) {
       if (!BOARD_ID_PATTERN.test(saved.id)) throw new Error('This board was removed')
       const index = boards.findIndex((board) => board.id === saved.id)
       if (params.board.id !== undefined && index < 0) throw new Error('This board was removed')
+      const previous = index >= 0 ? boards[index] : undefined
+      if (previous?.filters && JSON.stringify(previous.source) === JSON.stringify(saved.source)) saved.filters = previous.filters
       const next = index >= 0 ? boards.with(index, saved) : [...boards, saved]
       await writeBoards(ctx, next)
       return saved
+    },
+
+    'boards.setFilters': async (params: { boardId: string; filters: unknown }, ctx: ServerContext) => {
+      const boards = await readBoards(ctx)
+      const index = boards.findIndex((board) => board.id === params.boardId)
+      if (index < 0) throw new Error('This board was removed')
+      const filters = sanitizeGroup(params.filters)
+      await writeBoards(ctx, boards.with(index, { ...boards[index]!, filters }))
+      return filters
     },
 
     'boards.remove': async (params: { id: string }, ctx: ServerContext) => {
@@ -138,8 +158,8 @@ export function createMethods(deps: PluginDeps = {}) {
         const boards = await readBoards(ctx)
         const board = boards.find((candidate) => candidate.id === params.boardId)
         if (!board) throw new Error('This board was removed')
-        const loaded = await loadBoard(api, board, deadline)
-        const result = { board, ...loaded, loadedAt: new Date(clock.now()).toISOString() }
+        const [loaded, me] = await Promise.all([loadBoard(api, board, deadline), myUserId(api, deadline)])
+        const result = { board, ...loaded, me, loadedAt: new Date(clock.now()).toISOString() }
         void writeCachedBoard(ctx.data, board.id, result).catch((error) => ctx.log(`board cache not saved: ${String(error)}`))
         return result
       }),

@@ -386,3 +386,36 @@ describe('task.dossier', () => {
     expect(fake.calls[0].abortedAt).toBe(10000)
   })
 })
+
+describe('board filters', () => {
+  const viewBoard = { id: 'b-cccccccc', name: 'Planning', folder: '~/work', source: { kind: 'view', viewId: 'vw1', listId: 'li1' } }
+
+  test('board.load returns me, the field list and the view filter as rows', async () => {
+    const { methods, clock } = tokened(({ path }) => {
+      if (path === '/list/li1') return { body: listDetail }
+      if (path === '/list/li1/field') return { body: { fields: [{ id: 'plan', name: 'Planning', type: 'drop_down', type_config: { options: [{ id: 'o1', name: 'Sprint 17', orderindex: 0 }] } }] } }
+      if (path === '/view/vw1') return { body: { view: { filters: { op: 'AND', fields: [{ field: 'cf_plan', op: 'NOT', values: ['o1'] }] } } } }
+      if (path === '/view/vw1/task') return { body: { tasks: [{ id: 't1', name: 'One', status: { status: 'Open' }, assignees: [{ id: 42, username: 'Palm' }] }], last_page: true } }
+      if (path === '/user') return { body: { user: { id: 42, username: 'Palm' } } }
+      return { status: 404, body: {} }
+    })
+    const { ctx } = makeCtx({ token: 'pk_server', boards: JSON.stringify([viewBoard]) })
+    const result = await call(clock, methods['board.load']({ boardId: viewBoard.id }, ctx))
+    expect(result.me).toBe('42')
+    expect(result.fields.map((field: { label: string }) => field.label)).toContain('Planning')
+    expect(result.viewFilter).toEqual({ join: 'and', rows: [{ label: 'Planning', op: 'Is not', values: ['Sprint 17'] }] })
+    expect(result.columns[0].tasks[0].facts.assignees).toEqual(['42'])
+  })
+
+  test('setFilters stores cleaned filters, and editing the board keeps them unless its source changes', async () => {
+    const { methods } = tokened(() => ({ body: {} }))
+    const { ctx, store } = makeCtx({ token: 'pk_server', boards: JSON.stringify([viewBoard]) })
+    const saved = await methods['boards.setFilters']({ boardId: viewBoard.id, filters: { join: 'or', conditions: [{ field: 'tags', op: 'any', values: ['bug'] }, { field: 'x', op: 'nope' }] } }, ctx)
+    expect(saved).toEqual({ join: 'or', conditions: [{ field: 'tags', op: 'any', values: ['bug'] }] })
+    await methods['boards.save']({ board: { ...viewBoard, name: 'Renamed' } as never }, ctx)
+    expect(JSON.parse(store.get('boards')!)[0].filters).toEqual(saved)
+    await methods['boards.save']({ board: { ...viewBoard, source: { kind: 'list', listId: 'li2' } } as never }, ctx)
+    expect(JSON.parse(store.get('boards')!)[0].filters).toBeUndefined()
+    await expect(methods['boards.setFilters']({ boardId: 'b-dddddddd', filters: {} }, ctx)).rejects.toThrow('This board was removed')
+  })
+})

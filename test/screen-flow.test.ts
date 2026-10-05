@@ -23,6 +23,7 @@ type Script = {
   resolve?: (url: string) => ResolvedLink | Promise<ResolvedLink>
   loadGate?: (boardId: string) => Promise<void>
   cached?: (boardId: string) => unknown
+  extra?: Record<string, unknown>
   tree?: (node: TreeNode) => TreeChild[] | Promise<TreeChild[]>
 }
 
@@ -82,6 +83,12 @@ function makeMc(script: Script) {
             if (index >= 0) boards.splice(index, 1)
             return { ok: true }
           }
+          if (method === 'boards.setFilters') {
+            const { boardId, filters } = params as { boardId: string; filters: unknown }
+            const index = boards.findIndex((existing) => existing.id === boardId)
+            if (index >= 0) boards.splice(index, 1, { ...boards[index]!, filters } as Board)
+            return filters
+          }
           if (method === 'board.cached') return script.cached ? script.cached((params as { boardId: string }).boardId) : null
           if (method === 'board.load') {
             if (script.loadError) throw script.loadError
@@ -89,7 +96,7 @@ function makeMc(script: Script) {
             if (script.loadGate) await script.loadGate(boardId)
             const board = boards.find((existing) => existing.id === boardId)
             if (!board) throw new Error('This board was removed')
-            return { board, columns: script.loadColumns ?? [], partialFilters: script.partialFilters ?? false, loadedAt: new Date(Date.now() + 30_000).toISOString() }
+            return { board, columns: script.loadColumns ?? [], partialFilters: script.partialFilters ?? false, loadedAt: new Date(Date.now() + 30_000).toISOString(), ...(script.extra ?? {}) }
           }
           if (method === 'task.dossier') {
             return script.dossier ? await script.dossier((params as { taskId: string }).taskId) : { markdown: '# dossier', tasksFetched: 1, truncated: false }
@@ -632,5 +639,74 @@ describe('opening a board', () => {
     await settle(fake.inflight)
     expect(root.textContent).not.toContain('From the last visit')
     expect(root.textContent).toContain('HerMEZ kood queue stalls after deploy')
+  })
+})
+
+describe('filters', () => {
+  const facts = (over: Record<string, unknown>) => ({ status: 'open', tags: [], assignees: [], creator: null, priority: null, dates: { due: null, created: null, updated: null, closed: null }, fields: {}, ...over })
+  const bug = card({ id: 't-bug', name: 'Fix the export bug', facts: facts({ tags: ['bug'] }) } as never)
+  const cr = card({ id: 't-cr', name: 'Add a new report', facts: facts({ tags: ['cr'] }) } as never)
+  const columns: Column[] = [{ status: 'Open', color: '#87909e', tasks: [bug, cr] }]
+  const fields = [
+    { key: 'status', label: 'Status', kind: 'status', options: [{ id: 'open', name: 'Open' }] },
+    { key: 'tags', label: 'Tags', kind: 'tags', options: [{ id: 'bug', name: 'bug' }, { id: 'cr', name: 'cr' }] },
+  ]
+  const viewFilter = { join: 'and', rows: [{ label: 'Planning', op: 'Is not', values: ['Sprint 1', 'Sprint 2', 'Sprint 3', 'Sprint 4'] }] }
+
+  test('the view filter shows as a locked row and counts as one filter', async () => {
+    const { root, inflight } = await mountScreen({ tokenConfigured: true, boards: [board], loadColumns: columns, extra: { fields, viewFilter, me: 'u1' } })
+    expect(button(root, '1 Filter')).toBeTruthy()
+    button(root, '1 Filter').click()
+    await settle(inflight)
+    const locked = root.querySelector('.mk-filter-locked')!
+    expect(locked.textContent).toContain('Planning')
+    expect(locked.textContent).toContain('Is not')
+    expect(locked.textContent).toContain('Sprint 1, Sprint 2, Sprint 3 +1')
+    expect(locked.textContent).toContain('From your ClickUp view')
+  })
+
+  test('adding a Tags filter narrows the board and saves it with the board', async () => {
+    const { root, calls, inflight } = await mountScreen({ tokenConfigured: true, boards: [board], loadColumns: columns, extra: { fields, viewFilter: null, me: 'u1' } })
+    button(root, 'Filters').click()
+    await settle(inflight)
+    button(root, '+ Add filter').click()
+    await settle(inflight)
+    const fieldSelect = root.querySelector<HTMLSelectElement>('select[data-input="filter-field"]')!
+    fieldSelect.value = 'tags'
+    fieldSelect.dispatchEvent(new Event('change', { bubbles: true }))
+    await settle(inflight)
+    root.querySelector<HTMLButtonElement>('[data-act="filter-values"]')!.click()
+    await settle(inflight)
+    root.querySelector<HTMLButtonElement>('[data-act="filter-value-toggle"][data-value="bug"]')!.click()
+    await settle(inflight)
+    expect(root.textContent).toContain('Fix the export bug')
+    expect(root.textContent).not.toContain('Add a new report')
+    expect(root.textContent).toContain('Showing 1 of 2 tasks')
+    expect(button(root, '1 Filter')).toBeTruthy()
+    expect(calls.filter((call) => call.method === 'boards.setFilters').at(-1)?.params).toEqual({ boardId: board.id, filters: { join: 'and', conditions: [{ field: 'tags', op: 'any', values: ['bug'] }] } })
+    button(root, 'Clear all').click()
+    await settle(inflight)
+    expect(root.textContent).toContain('Add a new report')
+  })
+
+  test('search narrows the cards and keeps the same search box focused', async () => {
+    const { root, inflight } = await mountScreen({ tokenConfigured: true, boards: [board], loadColumns: columns, extra: { fields, viewFilter: null, me: null } })
+    const search = root.querySelector<HTMLInputElement>('input[data-input="board-search"]')!
+    search.focus()
+    search.value = 'REPORT'
+    search.dispatchEvent(new Event('input', { bubbles: true }))
+    await settle(inflight)
+    expect(root.textContent).toContain('Add a new report')
+    expect(root.textContent).not.toContain('Fix the export bug')
+    expect(root.querySelector('input[data-input="board-search"]')).toBe(search)
+    expect(root.textContent).toContain('Showing 1 of 2 tasks')
+  })
+
+  test("a board's saved filters apply as soon as it opens", async () => {
+    const saved = { ...board, filters: { join: 'and', conditions: [{ field: 'tags', op: 'none', values: ['bug'] }] } } as Board
+    const { root } = await mountScreen({ tokenConfigured: true, boards: [saved], loadColumns: columns, extra: { fields, viewFilter: null, me: null } })
+    expect(root.textContent).toContain('Add a new report')
+    expect(root.textContent).not.toContain('Fix the export bug')
+    expect(button(root, '1 Filter')).toBeTruthy()
   })
 })

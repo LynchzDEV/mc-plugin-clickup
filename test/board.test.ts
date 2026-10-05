@@ -170,7 +170,7 @@ describe('loadBoard', () => {
       listBoard,
     )
     const card = result.columns[0].tasks[0] as Card & { commentCount?: number }
-    expect(card).toEqual({
+    expect(card).toMatchObject({
       id: 'abc1',
       name: 'Rich task',
       url: 'https://app.clickup.com/t/abc1',

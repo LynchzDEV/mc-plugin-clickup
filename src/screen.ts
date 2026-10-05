@@ -3,8 +3,11 @@ import type { ScreenApi, SessionRequest } from '@mission-control/plugin-sdk'
 import type { Board, BoardSource, Card, Column } from './board'
 import type { TreeChild, TreeNode } from './tree'
 import { esc, renderBoardBar, renderColumns, renderEmpty, renderError, renderSprite } from './view'
+import type { ViewFilter } from './filter-catalog'
+import { applyFilters, matchesSearch, sanitizeGroup, type FilterField, type FilterGroup, type Operator } from './filters'
+import { activeCount, changeField, changeOperator, defaultCondition, FILTER_STYLES, renderFilterBar, renderFilterPanel, toggleValue, type PanelState } from './filter-panel'
 
-type Loaded = { board: Board; columns: Column[]; partialFilters: boolean; loadedAt: string }
+type Loaded = { board: Board; columns: Column[]; partialFilters: boolean; loadedAt: string; fields?: FilterField[]; viewFilter?: ViewFilter | null; me?: string | null }
 
 type ResolvedLink = { source: BoardSource; name: string; path: string }
 
@@ -46,7 +49,7 @@ function rowKey(child: TreeChild): string {
 export default defineScreen(mountScreen)
 
 async function mountScreen(root: HTMLElement, mc: ScreenApi): Promise<void> {
-  root.innerHTML = renderSprite()
+  root.innerHTML = `${renderSprite()}<style>${FILTER_STYLES}</style>`
   const shell = document.createElement('div')
   root.appendChild(shell)
 
@@ -59,6 +62,10 @@ async function mountScreen(root: HTMLElement, mc: ScreenApi): Promise<void> {
   let retry: (() => Promise<void>) | null = null
   let dialog: Dialog | null = null
   let loadSeq = 0
+  let filters: FilterGroup = { join: 'and', conditions: [] }
+  let filtersFor: string | null = null
+  let query = ''
+  let panel: PanelState = { open: false, picking: null }
   const attempts = new Map<string, { task: Card; kind: 'chat' | 'terminal' }>()
 
   function paint(): void {
@@ -76,10 +83,70 @@ async function mountScreen(root: HTMLElement, mc: ScreenApi): Promise<void> {
     }
   }
 
+  function syncFilters(): void {
+    if (filtersFor === boardId) return
+    filtersFor = boardId
+    filters = sanitizeGroup(boards.find((candidate) => candidate.id === boardId)?.filters)
+    panel = { open: false, picking: null }
+  }
+
+  function visibleColumns(): { columns: Column[]; shown: number; total: number } {
+    const columns = loaded?.columns ?? []
+    const context = { now: Date.now(), me: loaded?.me ?? null }
+    const total = columns.reduce((sum, column) => sum + column.tasks.length, 0)
+    const filtered = columns.map((column) => ({ ...column, tasks: applyFilters(column.tasks.filter((task) => matchesSearch(task, query)), filters, context) }))
+    return { columns: filtered, shown: filtered.reduce((sum, column) => sum + column.tasks.length, 0), total }
+  }
+
+  function columnsHtml(): string {
+    if (!loaded) return '<p class="muted">Loading board…</p>'
+    return renderColumns({ ...loaded, columns: visibleColumns().columns })
+  }
+
+  function filterBarHtml(): string {
+    if (!loaded) return ''
+    const { shown, total } = visibleColumns()
+    const fields = loaded.fields ?? []
+    return renderFilterBar(query, activeCount(filters, loaded.viewFilter ?? null), shown, total, panel) + renderFilterPanel(filters, fields, loaded.viewFilter ?? null, panel)
+  }
+
   function boardHtml(): string {
+    syncFilters()
     const bar = renderBoardBar(boards, boardId ?? boards[0]?.id ?? '', loaded?.loadedAt ?? null, Date.now())
-    const columns = loaded ? renderColumns(loaded) : '<p class="muted">Loading board…</p>'
-    return bar + columns
+    return `${bar}<div data-region="filters">${filterBarHtml()}</div><div data-region="columns">${columnsHtml()}</div>`
+  }
+
+  function paintFilters(): void {
+    const region = shell.querySelector('[data-region="filters"]')
+    const columns = shell.querySelector('[data-region="columns"]')
+    if (!region || !columns) return paint()
+    region.innerHTML = filterBarHtml()
+    columns.innerHTML = columnsHtml()
+  }
+
+  function paintColumnsOnly(): void {
+    const columns = shell.querySelector('[data-region="columns"]')
+    const count = shell.querySelector('.mk-filter-count')
+    if (!columns) return paint()
+    columns.innerHTML = columnsHtml()
+    const { shown, total } = visibleColumns()
+    if (count) count.textContent = shown === total ? '' : `Showing ${shown} of ${total} tasks`
+    else if (shown !== total) shell.querySelector('.mk-filter-bar')?.insertAdjacentHTML('beforeend', `<span class="mk-filter-count">Showing ${shown} of ${total} tasks</span>`)
+  }
+
+  function updateFilters(next: FilterGroup): void {
+    filters = next
+    paintFilters()
+    const target = boardId
+    if (target === null) return
+    void mc.call('boards.setFilters', { boardId: target, filters: next }).then(
+      (saved) => { boards = boards.map((candidate) => (candidate.id === target ? { ...candidate, filters: saved as FilterGroup } : candidate)) },
+      (failure) => { void mc.ui.toast(`Filters not saved: ${messageOf(failure)}`, 'error') },
+    )
+  }
+
+  function rowOf(hit: HTMLElement): number {
+    return Number(hit.getAttribute('data-row') ?? -1)
   }
 
   async function openBoards(): Promise<void> {
@@ -443,6 +510,40 @@ async function mountScreen(root: HTMLElement, mc: ScreenApi): Promise<void> {
       return openDialog('browse', editing)
     }
     if (act === 'remove-board') return removeBoard()
+    if (act === 'filters-toggle') {
+      panel = { open: !panel.open, picking: null }
+      paintFilters()
+      return
+    }
+    if (act === 'filter-add') {
+      updateFilters({ ...filters, conditions: [...filters.conditions, defaultCondition(loaded?.fields ?? [])] })
+      return
+    }
+    if (act === 'filter-remove') {
+      const index = rowOf(hit)
+      panel = { ...panel, picking: null }
+      updateFilters({ ...filters, conditions: filters.conditions.filter((_condition, at) => at !== index) })
+      return
+    }
+    if (act === 'filters-clear') {
+      panel = { ...panel, picking: null }
+      updateFilters({ ...filters, conditions: [] })
+      return
+    }
+    if (act === 'filter-values') {
+      const index = rowOf(hit)
+      panel = { ...panel, picking: panel.picking === index ? null : index }
+      paintFilters()
+      return
+    }
+    if (act === 'filter-value-toggle') {
+      const index = rowOf(hit)
+      const value = hit.getAttribute('data-value') ?? ''
+      const condition = filters.conditions[index]
+      if (!condition) return
+      updateFilters({ ...filters, conditions: filters.conditions.with(index, toggleValue(condition, value)) })
+      return
+    }
     if (act === 'refresh' || act === 'retry') return retry ? retry() : undefined
     if (act === 'change-token') {
       mode = 'token'
@@ -511,11 +612,32 @@ async function mountScreen(root: HTMLElement, mc: ScreenApi): Promise<void> {
       return
     }
     if (target.getAttribute('data-input') === 'link') void resolveLink()
+    const input = target.getAttribute('data-input')
+    const index = Number(target.getAttribute('data-row') ?? -1)
+    const value = (target as HTMLInputElement | HTMLSelectElement).value
+    const condition = filters.conditions[index]
+    if (input === 'filter-join') updateFilters({ ...filters, join: value === 'or' ? 'or' : 'and' })
+    if (input === 'filter-field' && condition) {
+      panel = { ...panel, picking: null }
+      updateFilters({ ...filters, conditions: filters.conditions.with(index, changeField(condition, value, loaded?.fields ?? [])) })
+    }
+    if (input === 'filter-op' && condition) updateFilters({ ...filters, conditions: filters.conditions.with(index, changeOperator(condition, value as Operator)) })
+    if (input === 'filter-date' && condition) updateFilters({ ...filters, conditions: filters.conditions.with(index, { ...condition, values: value === '' ? [] : [value] }) })
   })
 
   shell.addEventListener('input', (event) => {
     const target = event.target as HTMLElement
     if (target.getAttribute('data-input') === 'name' && dialog) dialog.nameTouched = true
+    if (target.getAttribute('data-input') === 'board-search') {
+      query = (target as HTMLInputElement).value
+      paintColumnsOnly()
+    }
+    if (target.getAttribute('data-input') === 'filter-value-query') {
+      const needle = (target as HTMLInputElement).value.trim().toLowerCase()
+      target.parentElement?.querySelectorAll<HTMLElement>('[data-act="filter-value-toggle"]').forEach((option) => {
+        option.hidden = needle !== '' && !(option.textContent ?? '').toLowerCase().includes(needle)
+      })
+    }
   })
 
   const view = await mc.settings.view()

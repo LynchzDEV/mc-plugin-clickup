@@ -1,5 +1,7 @@
 import { ApiError, TokenRejected, type ClickUp } from './clickup-api'
 import type { Deadline } from './deadline'
+import { describeViewFilter, factsOf, filterFields, type FactSource, type ListField, type ViewFilter } from './filter-catalog'
+import type { CardFacts, FilterField, FilterGroup } from './filters'
 
 const MAX_PAGES = 100
 const LIST_PAGE_SIZE = 100
@@ -7,7 +9,7 @@ const PAGE_WAVE = 4
 
 export type BoardSource = { kind: 'list'; listId: string } | { kind: 'view'; viewId: string; listId: string }
 
-export type Board = { id: string; name: string; folder: string; source: BoardSource }
+export type Board = { id: string; name: string; folder: string; source: BoardSource; filters?: FilterGroup }
 
 export type Card = {
   id: string
@@ -18,11 +20,12 @@ export type Card = {
   assignees: Array<{ initials: string; color: string }>
   subtaskCount: number
   commentCount?: number
+  facts: CardFacts
 }
 
 export type Column = { status: string; color: string; tasks: Card[] }
 
-export type LoadedBoard = { columns: Column[]; partialFilters: boolean }
+export type LoadedBoard = { columns: Column[]; partialFilters: boolean; fields: FilterField[]; viewFilter: ViewFilter | null }
 
 type StatusRecord = { status: string; orderindex?: number | string; color?: string }
 
@@ -34,13 +37,10 @@ export type ListDetail = {
   folder?: { name?: string; hidden?: boolean }
 }
 
-type TaskRecord = {
+type TaskRecord = FactSource & {
   id: string
   name?: string
   url?: string
-  status?: { status?: string }
-  tags?: Array<{ name?: string }>
-  assignees?: Array<{ username?: string; color?: string }>
   subtask_count?: number | string
   comment_count?: number | string
 }
@@ -74,9 +74,14 @@ async function boardColumns(api: ClickUp, board: Board, deadline: Deadline): Pro
     .map((status) => ({ status: status.status, color: status.color ?? '', tasks: [] as Card[] }))
   const byStatus = new Map(columns.map((column) => [column.status, column]))
   const extraColumns: Column[] = []
-  const { tasks, partialFilters } = await fetchTasks(api, board, deadline)
+  const [{ tasks, partialFilters }, listFields, viewSettings] = await Promise.all([
+    fetchTasks(api, board, deadline),
+    listFieldsOf(api, board.source.listId, deadline),
+    board.source.kind === 'view' ? viewFilterSource(api, board.source.viewId, deadline) : Promise.resolve(null),
+  ])
+  const fieldsById = new Map(listFields.map((field) => [field.id, field]))
   for (const task of tasks) {
-    const card = toCard(task)
+    const card = toCard(task, fieldsById)
     const column = byStatus.get(card.status)
     if (column) {
       column.tasks.push(card)
@@ -86,7 +91,29 @@ async function boardColumns(api: ClickUp, board: Board, deadline: Deadline): Pro
     if (extra) extra.tasks.push(card)
     else extraColumns.push({ status: card.status, color: '', tasks: [card] })
   }
-  return { columns: [...columns, ...extraColumns], partialFilters }
+  const fields = filterFields({ statuses: list.statuses ?? [], tasks, listFields })
+  const viewFilter = partialFilters ? null : describeViewFilter(viewSettings, fields)
+  return { columns: [...columns, ...extraColumns], partialFilters, fields, viewFilter }
+}
+
+async function listFieldsOf(api: ClickUp, listId: string, deadline: Deadline): Promise<ListField[]> {
+  try {
+    const body = (await api.get(`/list/${listId}/field`, deadline)) as { fields?: ListField[] }
+    return body.fields ?? []
+  } catch (error) {
+    if (error instanceof ApiError) return []
+    throw error
+  }
+}
+
+async function viewFilterSource(api: ClickUp, viewId: string, deadline: Deadline): Promise<unknown> {
+  try {
+    const body = (await api.get(`/view/${viewId}`, deadline)) as { view?: { filters?: unknown } }
+    return body.view?.filters ?? null
+  } catch (error) {
+    if (error instanceof ApiError || error instanceof TokenRejected) return null
+    throw error
+  }
 }
 
 async function fetchTasks(api: ClickUp, board: Board, deadline: Deadline): Promise<{ tasks: TaskRecord[]; partialFilters: boolean }> {
@@ -136,7 +163,7 @@ async function listTasks(api: ClickUp, listId: string, deadline: Deadline): Prom
   })
 }
 
-function toCard(task: TaskRecord): Card {
+function toCard(task: TaskRecord, fields: Map<string, ListField>): Card {
   return {
     id: String(task.id),
     name: task.name ?? '',
@@ -149,6 +176,7 @@ function toCard(task: TaskRecord): Card {
     })),
     subtaskCount: Number(task.subtask_count ?? 0),
     commentCount: task.comment_count === undefined ? undefined : Number(task.comment_count),
+    facts: factsOf(task, fields),
   }
 }
 
