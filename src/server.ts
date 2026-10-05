@@ -7,7 +7,7 @@ import { dropCachedBoard, readCachedBoard, writeCachedBoard } from './board-cach
 import { buildDossier } from './dossier'
 import { treeChildren, type TreeNode } from './tree'
 import { parseClickUpLink } from './links'
-import { sanitizeGroup } from './filters'
+import { applyFilters, emptyGroup, matchesSearch, sanitizeGroup } from './filters'
 
 const METHOD_TIMEOUT_MS = 25000
 const BOARD_ID_PATTERN = /^b-[0-9a-f]{8}$/
@@ -52,6 +52,18 @@ function isBoardInputValid(board: { name?: string; folder?: string }): boolean {
 
 export function createMethods(deps: PluginDeps = {}) {
   const clock = deps.clock ?? realClock
+  async function freshBoard(boardId: string, ctx: ServerContext) {
+    return withClickUp(ctx, async (api, deadline) => {
+      const boards = await readBoards(ctx)
+      const board = boards.find((candidate) => candidate.id === boardId)
+      if (!board) throw new Error('This board was removed')
+      const [loaded, me] = await Promise.all([loadBoard(api, board, deadline), myUserId(api, deadline)])
+      const result = { board, ...loaded, me, loadedAt: new Date(clock.now()).toISOString() }
+      void writeCachedBoard(ctx.data, board.id, result).catch((error) => ctx.log(`board cache not saved: ${String(error)}`))
+      return result
+    })
+  }
+
   async function myUserId(api: ClickUp, deadline: Deadline): Promise<string | null> {
     try {
       const body = (await api.get('/user', deadline)) as { user?: { id?: number | string } }
@@ -153,16 +165,17 @@ export function createMethods(deps: PluginDeps = {}) {
       return cached === null ? null : { ...cached, board }
     },
 
-    'board.load': async (params: { boardId: string }, ctx: ServerContext) =>
-      withClickUp(ctx, async (api, deadline) => {
-        const boards = await readBoards(ctx)
-        const board = boards.find((candidate) => candidate.id === params.boardId)
-        if (!board) throw new Error('This board was removed')
-        const [loaded, me] = await Promise.all([loadBoard(api, board, deadline), myUserId(api, deadline)])
-        const result = { board, ...loaded, me, loadedAt: new Date(clock.now()).toISOString() }
-        void writeCachedBoard(ctx.data, board.id, result).catch((error) => ctx.log(`board cache not saved: ${String(error)}`))
-        return result
-      }),
+    'board.load': (params: { boardId: string }, ctx: ServerContext) => freshBoard(params.boardId, ctx),
+
+    'board.view': async (params: { boardId: string; search?: string; filters?: unknown; ignoreSaved?: boolean }, ctx: ServerContext) => {
+      const loaded = await freshBoard(params.boardId, ctx)
+      const filters = params.filters !== undefined ? sanitizeGroup(params.filters) : params.ignoreSaved ? emptyGroup() : sanitizeGroup(loaded.board.filters)
+      const search = typeof params.search === 'string' ? params.search : ''
+      const context = { now: clock.now(), me: loaded.me }
+      const columns = loaded.columns.map((column) => ({ ...column, tasks: applyFilters(column.tasks.filter((task) => matchesSearch(task, search)), filters, context) }))
+      const count = (list: typeof columns) => list.reduce((sum, column) => sum + column.tasks.length, 0)
+      return { ...loaded, columns, filters, search, shown: count(columns), total: count(loaded.columns) }
+    },
 
     'task.dossier': async (params: { taskId: string }, ctx: ServerContext) =>
       withClickUp(ctx, (api, deadline) => buildDossier(api, params.taskId, { clock }, deadline)),

@@ -419,3 +419,28 @@ describe('board filters', () => {
     await expect(methods['boards.setFilters']({ boardId: 'b-dddddddd', filters: {} }, ctx)).rejects.toThrow('This board was removed')
   })
 })
+
+describe('board.view', () => {
+  const tagged = { id: 'b-eeeeeeee', name: 'Tagged', folder: '~/w', source: { kind: 'list', listId: 'li1' }, filters: { join: 'and', conditions: [{ field: 'tags', op: 'any', values: ['bug'] }] } }
+  const respond = ({ path }: { path: string }) => {
+    if (path === '/list/li1') return { body: listDetail }
+    if (path === '/list/li1/task') return { body: { tasks: [
+      { id: 't1', name: 'Fix login', status: { status: 'Open' }, tags: [{ name: 'bug' }] },
+      { id: 't2', name: 'New report', status: { status: 'Open' }, tags: [{ name: 'cr' }] },
+    ] } }
+    if (path === '/user') return { body: { user: { id: 1 } } }
+    return { status: 404, body: {} }
+  }
+
+  test('applies the saved filters and search, with counts', async () => {
+    const { methods, clock } = tokened(respond)
+    const { ctx } = makeCtx({ token: 'pk_server', boards: JSON.stringify([tagged]) })
+    const saved = await call(clock, methods['board.view']({ boardId: tagged.id }, ctx))
+    expect(saved.columns[0].tasks.map((task: { id: string }) => task.id)).toEqual(['t1'])
+    expect([saved.shown, saved.total]).toEqual([1, 2])
+    const all = await call(clock, methods['board.view']({ boardId: tagged.id, ignoreSaved: true, search: 'REPORT' }, ctx))
+    expect(all.columns[0].tasks.map((task: { id: string }) => task.id)).toEqual(['t2'])
+    const given = await call(clock, methods['board.view']({ boardId: tagged.id, filters: { join: 'and', conditions: [{ field: 'tags', op: 'none', values: ['bug'] }] } }, ctx))
+    expect(given.columns[0].tasks.map((task: { id: string }) => task.id)).toEqual(['t2'])
+  })
+})
