@@ -55,7 +55,7 @@ describe('renderColumns', () => {
     expect(html).toContain('<span class="mk-chip">hermez</span>')
     expect(html).toContain('<span class="mk-av" style="--a:#8062bd">JV</span>')
     expect(html).toContain('>Start chat</button>')
-    expect(html).toContain('>Start terminal</button>')
+    expect(html).toContain('<span>Start terminal</span></button>')
     expect(html.match(/<section class="mk-col"/g)).toHaveLength(2)
     expect(html).not.toContain(PARTIAL_FILTERS_NOTE)
   })
@@ -83,6 +83,22 @@ describe('renderCard', () => {
     expect(html).toContain('<article class="mk-card" data-task="86d3j8w1c" tabindex="0">')
     expect(html).toContain('>Start chat</button>')
     expect(renderCard(card(), true)).toContain('tabindex="0"')
+  })
+
+  test('assignees sit beside the title so a narrow column never pushes them out of the card', () => {
+    const html = renderCard(card({ assignees: [{ initials: 'JV', color: '#8062bd' }, { initials: 'PM', color: '#3f7352' }] }))
+    expect(html).toContain('<div class="mk-head"><strong>HerMEZ kood queue stalls after deploy</strong><span class="mk-crew"><span class="mk-av" style="--a:#8062bd">JV</span><span class="mk-av" style="--a:#3f7352">PM</span></span></div>')
+    expect(html).toContain('<span class="mk-id">86d3j8w1c</span>')
+  })
+
+  test('a card without assignees keeps the title alone in its head', () => {
+    expect(renderCard(card({ assignees: [] }))).toContain('<div class="mk-head"><strong>HerMEZ kood queue stalls after deploy</strong></div>')
+  })
+
+  test('Start terminal is an icon button that keeps its label for screen readers and tooltips', () => {
+    const html = renderCard(card())
+    expect(html).toContain('class="connection-button mk-icon-only" data-act="start-terminal" data-task="86d3j8w1c" title="Start terminal" aria-label="Start terminal"')
+    expect(html).toContain('<span>Start terminal</span></button>')
   })
 })
 

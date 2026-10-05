@@ -65,11 +65,12 @@ export function renderCard(task: Card, gathering = false): string {
   const tags = task.tags.map((tag) => `<span class="mk-chip">${esc(tag)}</span>`).join('')
   const subtasks = task.subtaskCount > 0 ? `<span><svg><use href="#mk-sub"></use></svg>${task.subtaskCount}</span>` : ''
   const comments = task.commentCount ? `<span><svg><use href="#mk-comment"></use></svg>${task.commentCount}</span>` : ''
-  const crew = task.assignees.map((who) => `<span class="mk-av" style="--a:${esc(who.color)}">${esc(who.initials)}</span>`).join('')
+  const avatars = task.assignees.map((who) => `<span class="mk-av" style="--a:${esc(who.color)}">${esc(who.initials)}</span>`).join('')
+  const crew = avatars ? `<span class="mk-crew">${avatars}</span>` : ''
   const acts = gathering
     ? '<span class="muted">Gathering task…</span>'
-    : `<button type="button" class="connection-button primary" data-act="start-chat" data-task="${esc(task.id)}"><svg><use href="#mk-chat"></use></svg>Start chat</button><button type="button" class="connection-button" data-act="start-terminal" data-task="${esc(task.id)}"><svg><use href="#terminal-icon"></use></svg>Start terminal</button>`
-  return `<article class="mk-card" data-task="${esc(task.id)}" tabindex="0"${gathering ? ' data-hover=""' : ''}><strong>${esc(task.name)}</strong><div class="mk-meta">${tags}<span>${esc(task.id)}</span><span class="sp"></span>${subtasks}${comments}${crew}</div><div class="mk-acts">${acts}</div></article>`
+    : `<button type="button" class="connection-button primary" data-act="start-chat" data-task="${esc(task.id)}"><svg><use href="#mk-chat"></use></svg>Start chat</button><button type="button" class="connection-button mk-icon-only" data-act="start-terminal" data-task="${esc(task.id)}" title="Start terminal" aria-label="Start terminal"><svg><use href="#terminal-icon"></use></svg><span>Start terminal</span></button>`
+  return `<article class="mk-card" data-task="${esc(task.id)}" tabindex="0"${gathering ? ' data-hover=""' : ''}><div class="mk-head"><strong>${esc(task.name)}</strong>${crew}</div><div class="mk-meta">${tags}<span class="mk-id">${esc(task.id)}</span><span class="sp"></span>${subtasks}${comments}</div><div class="mk-acts">${acts}</div></article>`
 }
 
 export function renderError(message: string, actions: ErrorActions = {}): string {
