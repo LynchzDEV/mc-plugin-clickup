@@ -1,10 +1,10 @@
 {
   "name": "mc-plugin-clickup",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "private": true,
   "type": "module",
   "dependencies": {
-    "@mission-control/plugin-sdk": "github:LynchzDEV/mc-plugin-sdk#v0.1.0"
+    "@mission-control/plugin-sdk": "github:LynchzDEV/mc-plugin-sdk#v0.1.1"
   },
   "devDependencies": {
     "@happy-dom/global-registrator": "^20.14.5"
