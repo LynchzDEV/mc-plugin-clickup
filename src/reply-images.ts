@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import { mkdir, rename, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { Clock, Deadline } from './deadline'
 
@@ -7,6 +7,8 @@ export const MAX_IMAGES_PER_REPLY = 4
 export const MAX_IMAGES_PER_RESULT = 8
 export const IMAGE_TIMEOUT_MS = 10000
 export const MAX_IMAGE_BYTES = 3_932_160
+export const REPLY_IMAGE_TTL_MS = 7 * 24 * 60 * 60 * 1000
+export const PART_FILE_TTL_MS = 60 * 60 * 1000
 
 const IMAGE_HOST_SUFFIX = '.clickup-attachments.com'
 const REPLIES_FOLDER = 'replies'
@@ -108,4 +110,32 @@ export async function downloadReplyImages(commentId: string, urls: string[], sto
     }),
   )
   return outcomes.filter((outcome): outcome is DownloadedImage => outcome !== null)
+}
+
+const isMissing = (error: unknown): boolean => (error as NodeJS.ErrnoException | null)?.code === 'ENOENT'
+
+async function pruneEntry(folder: string, name: string, now: number): Promise<void> {
+  const file = join(folder, name)
+  const stats = await lstat(file)
+  const ttl = name.endsWith(PART_SUFFIX) ? PART_FILE_TTL_MS : REPLY_IMAGE_TTL_MS
+  if (stats.isFile() && now - stats.mtimeMs > ttl) await rm(file, { force: true })
+}
+
+async function pruneFolder(store: ImageStore): Promise<void> {
+  const folder = join(store.data, REPLIES_FOLDER)
+  const folderStats = await lstat(folder).catch((error: unknown) => {
+    if (isMissing(error)) return null
+    throw error
+  })
+  if (folderStats === null) return
+  if (!folderStats.isDirectory()) throw new Error('replies is not a folder')
+  const now = store.clock.now()
+  const outcomes = await Promise.allSettled((await readdir(folder)).map((name) => pruneEntry(folder, name, now)))
+  const failure = outcomes.find((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected' && !isMissing(outcome.reason))
+  if (failure) throw failure.reason
+}
+
+export async function pruneReplyImages(store: ImageStore): Promise<void> {
+  if (store.data === '') return
+  await pruneFolder(store).catch((error: unknown) => store.log(`reply images not pruned: ${String(error)}`))
 }

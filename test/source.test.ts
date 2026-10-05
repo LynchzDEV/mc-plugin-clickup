@@ -1,9 +1,10 @@
 import { afterAll, describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, lutimesSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createClickUp } from '../src/clickup-api'
 import { createDeadline } from '../src/deadline'
+import { REPLY_IMAGE_TTL_MS } from '../src/reply-images'
 import { askText, isTaskId, sourceItem, sourcePost, sourceReplies } from '../src/source'
 import { drain, fakeClock, settle, type FakeClock } from './helpers/fake-clock'
 import { fakeClickUp, type Responder } from './helpers/fake-clickup'
@@ -409,5 +410,77 @@ describe('sourceReplies image writes', () => {
     expect(results.map((result) => result.replies[0]!.images)).toEqual([[{ name: '6-0.png', path: 'replies/6-0.png' }], [{ name: '6-0.png', path: 'replies/6-0.png' }]])
     expect(readdirSync(join(data, 'replies'))).toEqual(['6-0.png'])
     expect(new Uint8Array(readFileSync(join(data, 'replies', '6-0.png')))).toEqual(new Uint8Array(Buffer.concat(body)))
+  })
+})
+
+const HOUR = 60 * 60 * 1000
+const PRUNE_NOW = Date.now() + 30 * 24 * HOUR
+
+function placeFile(folder: string, name: string, ageMs: number): string {
+  const file = join(folder, name)
+  writeFileSync(file, 'x')
+  const when = new Date(PRUNE_NOW - ageMs)
+  utimesSync(file, when, when)
+  return file
+}
+
+function pruneSetup() {
+  const setup = repliesSetup([comment('2', 200, 'ok')])
+  const folder = join(setup.data, 'replies')
+  mkdirSync(folder)
+  return { ...setup, folder, store: { ...setup.store, clock: fakeClock(PRUNE_NOW) } }
+}
+
+describe('sourceReplies prunes old reply images', () => {
+  test('removes images older than seven days and keeps newer ones', async () => {
+    const { clock, api, deadline, store, folder } = pruneSetup()
+    placeFile(folder, 'old-0.png', REPLY_IMAGE_TTL_MS + HOUR)
+    placeFile(folder, 'fresh-0.png', REPLY_IMAGE_TTL_MS - HOUR)
+    const result = await settleWithDisk(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))
+    expect(result.replies.map((reply) => reply.text)).toEqual(['ok'])
+    expect(readdirSync(folder)).toEqual(['fresh-0.png'])
+  })
+
+  test('removes leftover partial files after an hour but not while a download may still be writing', async () => {
+    const { clock, api, deadline, store, folder } = pruneSetup()
+    placeFile(folder, '.stale.png.aa.part', 2 * HOUR)
+    placeFile(folder, '.busy.png.bb.part', HOUR / 2)
+    await settleWithDisk(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))
+    expect(readdirSync(folder)).toEqual(['.busy.png.bb.part'])
+  })
+
+  test('leaves symlinks, their targets and folders alone however old they are', async () => {
+    const { clock, api, deadline, store, folder, data } = pruneSetup()
+    const target = placeFile(data, 'outside.png', REPLY_IMAGE_TTL_MS * 2)
+    const link = join(folder, 'link.png')
+    symlinkSync(target, link)
+    const old = new Date(PRUNE_NOW - REPLY_IMAGE_TTL_MS * 2)
+    lutimesSync(link, old, old)
+    mkdirSync(join(folder, 'nested'))
+    utimesSync(join(folder, 'nested'), old, old)
+    await settleWithDisk(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))
+    expect(readdirSync(folder).sort()).toEqual(['link.png', 'nested'])
+    expect(existsSync(target)).toBe(true)
+  })
+
+  test('still returns the replies and logs when pruning fails', async () => {
+    const { clock, api, deadline, store, folder, logs } = pruneSetup()
+    placeFile(folder, 'old-0.png', REPLY_IMAGE_TTL_MS + HOUR)
+    chmodSync(folder, 0o000)
+    try {
+      const result = await settleWithDisk(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))
+      expect(result).toEqual({ replies: [{ id: '2', author: 'Ploy', text: 'ok', images: [] }], lastId: '200' })
+      expect(logs).toHaveLength(1)
+      expect(logs[0]).toContain('reply images not pruned')
+    } finally {
+      chmodSync(folder, 0o755)
+    }
+  })
+
+  test('says nothing when there is no replies folder yet', async () => {
+    const { clock, api, deadline, store, data, logs } = repliesSetup([comment('2', 200, 'ok')])
+    await settleWithDisk(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))
+    expect(existsSync(join(data, 'replies'))).toBe(false)
+    expect(logs).toEqual([])
   })
 })

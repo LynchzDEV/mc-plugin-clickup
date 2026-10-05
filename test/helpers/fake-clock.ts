@@ -4,6 +4,8 @@ export type FakeClock = Clock & { advance(ms: number): Promise<void> }
 
 type FakeTimer = { at: number; seq: number; fn: () => void; cancelled: boolean }
 
+const yieldToIo = (): Promise<void> => new Promise((resolve) => setImmediate(resolve))
+
 async function flushMicrotasks(): Promise<void> {
   for (let i = 0; i < 50; i++) await Promise.resolve()
 }
@@ -56,7 +58,10 @@ export async function settle<T>(clock: FakeClock, promise: Promise<T>): Promise<
       done = true
     },
   )
-  for (let i = 0; i < 5000 && !done; i++) await clock.advance(0)
+  for (let i = 0; i < 5000 && !done; i++) {
+    await clock.advance(0)
+    await yieldToIo()
+  }
   if (!done) throw new Error('promise did not settle under the fake clock')
   return await promise
 }
@@ -79,6 +84,7 @@ export async function drain<T>(
   )
   while (!done && clock.now() < horizon) {
     await clock.advance(Math.min(step, horizon - clock.now()))
+    await yieldToIo()
   }
   if (!done) throw new Error('promise did not settle before the fake-clock horizon')
   return await promise

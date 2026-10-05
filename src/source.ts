@@ -1,7 +1,7 @@
 import type { ClickUp } from './clickup-api'
 import type { Clock, Deadline } from './deadline'
 import { buildDossier } from './dossier'
-import { downloadReplyImages, isAttachmentUrl, MAX_IMAGES_PER_REPLY, MAX_IMAGES_PER_RESULT, type DownloadedImage, type ImageStore, type SavedImage } from './reply-images'
+import { downloadReplyImages, isAttachmentUrl, pruneReplyImages, MAX_IMAGES_PER_REPLY, MAX_IMAGES_PER_RESULT, type DownloadedImage, type ImageStore, type SavedImage } from './reply-images'
 
 export const MC_MARKER = '— Mission Control'
 export const ASK_HEADER = 'ขอถามเพิ่มเติมก่อนเริ่มงานนี้นิดนึงครับ'
@@ -94,6 +94,7 @@ const dateOf = (raw: RawComment): number => Number(raw.date ?? 0)
 
 export async function sourceReplies(api: ClickUp, input: { id: string; sinceId: string | null }, deadline: Deadline, images: ImageStore): Promise<{ replies: SourceReply[]; lastId: string | null }> {
   const task = taskId(input.id)
+  const pruned = pruneReplyImages(images)
   const since = Number(input.sinceId ?? 0)
   const top = ((await api.get(`/task/${task}/comment`, deadline)) as CommentList).comments ?? []
   const threaded = top.filter((raw) => Number(raw.reply_count ?? 0) > 0).slice(0, MAX_THREADS)
@@ -109,5 +110,6 @@ export async function sourceReplies(api: ClickUp, input: { id: string; sinceId: 
   const replies = await Promise.all(
     planImages(fresh).map(async ({ raw, links, wanted }) => toReply(raw, links, await downloadReplyImages(String(raw.id), wanted, images, deadline))),
   )
+  await pruned
   return { replies, lastId: newest > since ? String(newest) : input.sinceId }
 }
