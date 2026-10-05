@@ -1,9 +1,18 @@
-import { describe, expect, test } from 'bun:test'
+import { afterAll, describe, expect, test } from 'bun:test'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { createClickUp } from '../src/clickup-api'
 import { createDeadline } from '../src/deadline'
 import { askText, isTaskId, sourceItem, sourcePost, sourceReplies } from '../src/source'
-import { fakeClock, settle } from './helpers/fake-clock'
+import { drain, fakeClock, settle, type FakeClock } from './helpers/fake-clock'
 import { fakeClickUp, type Responder } from './helpers/fake-clickup'
+import { fakeImages, type ImageReply } from './helpers/fake-images'
+
+const dataDirs: string[] = []
+afterAll(() => {
+  for (const dir of dataDirs) rmSync(dir, { recursive: true, force: true })
+})
 
 function setup(respond: Responder) {
   const clock = fakeClock()
@@ -115,19 +124,23 @@ describe('sourcePost', () => {
 
 const comment = (id: string, date: number, text: string, extra: Record<string, unknown> = {}) => ({ id, date: String(date), comment_text: text, user: { username: 'Ploy' }, reply_count: 0, ...extra })
 
-function repliesSetup(top: unknown[], threads: Record<string, unknown[]> = {}) {
-  return setup(({ path }) => {
+function repliesSetup(top: unknown[], threads: Record<string, unknown[]> = {}, image: (url: string) => ImageReply = () => ({ status: 404 })) {
+  const base = setup(({ path }) => {
     if (path === '/task/t1/comment') return { body: { comments: top } }
     const thread = /^\/comment\/([^/]+)\/reply$/.exec(path)
     if (thread) return { body: { comments: threads[thread[1]!] ?? [] } }
     return { status: 404, body: {} }
   })
+  const data = mkdtempSync(join(tmpdir(), 'mc-plugin-clickup-replies-'))
+  dataDirs.push(data)
+  const images = fakeImages(image)
+  return { ...base, data, images, store: { data, fetch: images.fetchImpl, clock: base.clock } }
 }
 
 describe('sourceReplies', () => {
   test('returns new top-level comments oldest first with the newest date as cursor', async () => {
-    const { clock, api, deadline } = repliesSetup([comment('3', 300, 'second'), comment('2', 200, 'first'), comment('1', 100, 'old')])
-    const result = await settle(clock, sourceReplies(api, { id: 't1', sinceId: '150' }, deadline))
+    const { clock, api, deadline, store } = repliesSetup([comment('3', 300, 'second'), comment('2', 200, 'first'), comment('1', 100, 'old')])
+    const result = await settle(clock, sourceReplies(api, { id: 't1', sinceId: '150' }, deadline, store))
     expect(result.replies).toEqual([
       { id: '2', author: 'Ploy', text: 'first', images: [] },
       { id: '3', author: 'Ploy', text: 'second', images: [] },
@@ -136,28 +149,28 @@ describe('sourceReplies', () => {
   })
 
   test('skips the Mission Control ask but still advances the cursor past it', async () => {
-    const { clock, api, deadline } = repliesSetup([comment('4', 400, `${askText(['หน้าไหนครับ'])}\n`), comment('3', 300, 'answer')])
-    const result = await settle(clock, sourceReplies(api, { id: 't1', sinceId: '100' }, deadline))
+    const { clock, api, deadline, store } = repliesSetup([comment('4', 400, `${askText(['หน้าไหนครับ'])}\n`), comment('3', 300, 'answer')])
+    const result = await settle(clock, sourceReplies(api, { id: 't1', sinceId: '100' }, deadline, store))
     expect(result.replies.map((reply) => reply.text)).toEqual(['answer'])
     expect(result.lastId).toBe('400')
   })
 
   test('returns thread replies under any comment', async () => {
-    const { clock, api, deadline } = repliesSetup([comment('4', 400, 'q\n— Mission Control', { reply_count: 1 })], { '4': [comment('5', 500, 'หน้า login ครับ')] })
-    const result = await settle(clock, sourceReplies(api, { id: 't1', sinceId: '400' }, deadline))
+    const { clock, api, deadline, store } = repliesSetup([comment('4', 400, 'q\n— Mission Control', { reply_count: 1 })], { '4': [comment('5', 500, 'หน้า login ครับ')] })
+    const result = await settle(clock, sourceReplies(api, { id: 't1', sinceId: '400' }, deadline, store))
     expect(result.replies.map((reply) => reply.text)).toEqual(['หน้า login ครับ'])
     expect(result.lastId).toBe('500')
   })
 
   test('keeps the cursor when nothing is newer', async () => {
     const older = repliesSetup([comment('1', 100, 'old')])
-    expect(await settle(older.clock, sourceReplies(older.api, { id: 't1', sinceId: '900' }, older.deadline))).toEqual({ replies: [], lastId: '900' })
+    expect(await settle(older.clock, sourceReplies(older.api, { id: 't1', sinceId: '900' }, older.deadline, older.store))).toEqual({ replies: [], lastId: '900' })
     const empty = repliesSetup([])
-    expect(await settle(empty.clock, sourceReplies(empty.api, { id: 't1', sinceId: null }, empty.deadline))).toEqual({ replies: [], lastId: null })
+    expect(await settle(empty.clock, sourceReplies(empty.api, { id: 't1', sinceId: null }, empty.deadline, empty.store))).toEqual({ replies: [], lastId: null })
   })
 
   test('lists image links in the reply text', async () => {
-    const { clock, api, deadline } = repliesSetup([
+    const { clock, api, deadline, store } = repliesSetup([
       comment('6', 600, 'see', {
         comment: [
           { text: 'see' },
@@ -166,7 +179,7 @@ describe('sourceReplies', () => {
         ],
       }),
     ])
-    const result = await settle(clock, sourceReplies(api, { id: 't1', sinceId: '0' }, deadline))
+    const result = await settle(clock, sourceReplies(api, { id: 't1', sinceId: '0' }, deadline, store))
     expect(result.replies).toEqual([
       {
         id: '6',
@@ -179,21 +192,21 @@ describe('sourceReplies', () => {
 
   test('reads at most ten threads', async () => {
     const top = Array.from({ length: 12 }, (_, index) => comment(`c${index}`, 100 + index, `t${index}`, { reply_count: 1 }))
-    const { clock, api, deadline, fake } = repliesSetup(top)
-    await settle(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline))
+    const { clock, api, deadline, fake, store } = repliesSetup(top)
+    await settle(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))
     expect(fake.calls.filter((call) => /^\/comment\/[^/]+\/reply$/.test(call.path))).toHaveLength(10)
   })
 
   test('refuses a bad id before any request', async () => {
-    const { api, deadline, fake } = repliesSetup([])
-    await expect(sourceReplies(api, { id: 'a/b', sinceId: null }, deadline)).rejects.toThrow('Not a ClickUp task id')
+    const { api, deadline, fake, store } = repliesSetup([])
+    await expect(sourceReplies(api, { id: 'a/b', sinceId: null }, deadline, store)).rejects.toThrow('Not a ClickUp task id')
     expect(fake.calls).toHaveLength(0)
   })
 
   test('clamps reply text, author and id to the host limits', async () => {
     const long = comment('i'.repeat(250), 700, 't'.repeat(70000), { user: { username: 'a'.repeat(300) } })
-    const { clock, api, deadline } = repliesSetup([long])
-    const [reply] = (await settle(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline))).replies
+    const { clock, api, deadline, store } = repliesSetup([long])
+    const [reply] = (await settle(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))).replies
     expect(reply!.text).toHaveLength(64000)
     expect(reply!.author).toHaveLength(200)
     expect(reply!.id).toHaveLength(200)
@@ -201,8 +214,8 @@ describe('sourceReplies', () => {
 
   test('keeps only the newest hundred replies, still oldest first, with the cursor at the newest', async () => {
     const top = Array.from({ length: 105 }, (_, index) => comment(String(index), 1000 + index, `r${index}`))
-    const { clock, api, deadline } = repliesSetup(top)
-    const result = await settle(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline))
+    const { clock, api, deadline, store } = repliesSetup(top)
+    const result = await settle(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))
     expect(result.replies).toHaveLength(100)
     expect(result.replies[0]!.text).toBe('r5')
     expect(result.replies[99]!.text).toBe('r104')
@@ -210,8 +223,8 @@ describe('sourceReplies', () => {
   })
 
   test('names an unknown author and turns a numeric id into a string', async () => {
-    const { clock, api, deadline } = repliesSetup([{ id: 77, date: 800, comment_text: '  hi  ' }])
-    const result = await settle(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline))
+    const { clock, api, deadline, store } = repliesSetup([{ id: 77, date: 800, comment_text: '  hi  ' }])
+    const result = await settle(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))
     expect(result.replies).toEqual([{ id: '77', author: 'someone', text: 'hi', images: [] }])
   })
 })
@@ -221,21 +234,134 @@ describe('sourceReplies own-ask detection', () => {
 
   test('returns a reply that quotes the whole question and answers below it', async () => {
     const quoted = `${ask}\n\n1. หน้า login\n2. Thai`
-    const { clock, api, deadline } = repliesSetup([comment('7', 700, quoted)])
-    const result = await settle(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline))
+    const { clock, api, deadline, store } = repliesSetup([comment('7', 700, quoted)])
+    const result = await settle(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))
     expect(result.replies.map((reply) => reply.text)).toEqual([quoted])
   })
 
   test('returns a comment that ends with the marker but lacks the ask header', async () => {
     const signed = 'ok ทำได้เลย\n— Mission Control'
-    const { clock, api, deadline } = repliesSetup([comment('7', 700, signed)])
-    const result = await settle(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline))
+    const { clock, api, deadline, store } = repliesSetup([comment('7', 700, signed)])
+    const result = await settle(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))
     expect(result.replies.map((reply) => reply.text)).toEqual([signed])
   })
 
   test('skips the ask even with blank lines and spaces around it', async () => {
-    const { clock, api, deadline } = repliesSetup([comment('7', 700, `\n  ${ask.replace('\n— Mission Control', '\n  — Mission Control  ')}\n\n`)])
-    const result = await settle(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline))
+    const { clock, api, deadline, store } = repliesSetup([comment('7', 700, `\n  ${ask.replace('\n— Mission Control', '\n  — Mission Control  ')}\n\n`)])
+    const result = await settle(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))
     expect(result).toEqual({ replies: [], lastId: '700' })
+  })
+})
+
+const PNG = new Uint8Array([137, 80, 78, 71, 13, 10])
+const host = (name: string) => `https://t1.p.clickup-attachments.com/${name}`
+const withImages = (id: string, date: number, urls: string[]) =>
+  comment(id, date, 'see', { comment: urls.map((url) => ({ type: 'image', image: { url } })) })
+
+async function settleWithDisk<T>(clock: FakeClock, promise: Promise<T>): Promise<T> {
+  let done = false
+  promise.then(() => { done = true }, () => { done = true })
+  for (let i = 0; i < 500 && !done; i++) {
+    await clock.advance(0)
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+  if (!done) throw new Error('promise did not settle')
+  return await promise
+}
+
+describe('sourceReplies image downloads', () => {
+  test('saves an allowed image under replies/ and drops its link from the text', async () => {
+    const { clock, api, deadline, store, data } = repliesSetup([withImages('6', 600, [host('a.png')])], {}, () => ({ type: 'image/png', chunks: [PNG] }))
+    const result = await settleWithDisk(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))
+    expect(result.replies).toEqual([{ id: '6', author: 'Ploy', text: 'see', images: [{ name: '6-0.png', path: 'replies/6-0.png' }] }])
+    expect(new Uint8Array(readFileSync(join(data, 'replies', '6-0.png')))).toEqual(PNG)
+  })
+
+  test('names the file after the content type and overwrites an earlier copy', async () => {
+    const types = ['image/jpeg; charset=binary', 'image/gif', 'image/webp']
+    const { clock, api, deadline, store, data } = repliesSetup([withImages('6', 600, types.map((_, index) => host(`${index}`)))], {}, (url) => ({ type: types[Number(url.at(-1))], chunks: [PNG] }))
+    const first = await settleWithDisk(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))
+    expect(first.replies[0]!.images.map((image) => image.name)).toEqual(['6-0.jpg', '6-1.gif', '6-2.webp'])
+    const again = await settleWithDisk(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))
+    expect(again.replies[0]!.images).toEqual(first.replies[0]!.images)
+    expect(existsSync(join(data, 'replies', '6-2.webp'))).toBe(true)
+  })
+
+  test('never sends the ClickUp token or any header with an image request', async () => {
+    const { clock, api, deadline, store, images, fake } = repliesSetup([withImages('6', 600, [host('a.png')])], {}, () => ({ type: 'image/png' }))
+    await settleWithDisk(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))
+    expect(images.calls).toHaveLength(1)
+    expect([...new Headers(images.calls[0]!.init?.headers).keys()]).toEqual([])
+    expect(fake.calls.every((call) => !call.url.includes('clickup-attachments'))).toBe(true)
+  })
+
+  test('leaves links on other hosts, plain http and look-alike hosts untouched', async () => {
+    const links = ['https://evil.example.com/a.png', 'http://t1.p.clickup-attachments.com/a.png', 'https://clickup-attachments.com.evil.io/a.png', 'https://u:p@t1.p.clickup-attachments.com/a.png', 'not a url']
+    const { clock, api, deadline, store, images } = repliesSetup([withImages('6', 600, links)], {}, () => ({ type: 'image/png' }))
+    const result = await settleWithDisk(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))
+    expect(images.calls).toHaveLength(0)
+    expect(result.replies[0]).toEqual({ id: '6', author: 'Ploy', text: ['see', ...links.map((url) => `Image: ${url}`)].join('\n'), images: [] })
+  })
+
+  test('keeps the link when the image is over the cap by header or by stream, and stops reading', async () => {
+    const big = new Uint8Array(1024 * 1024)
+    const { clock, api, deadline, store, images, data } = repliesSetup([withImages('6', 600, [host('declared.png'), host('streamed.png')])], {}, (url) =>
+      url.endsWith('declared.png') ? { type: 'image/png', length: '3932161' } : { type: 'image/png', endless: big },
+    )
+    const result = await settleWithDisk(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))
+    expect(result.replies[0]!.images).toEqual([])
+    expect(result.replies[0]!.text).toBe(`see\nImage: ${host('declared.png')}\nImage: ${host('streamed.png')}`)
+    expect(images.pulls()).toBeLessThanOrEqual(6)
+    expect(existsSync(join(data, 'replies'))).toBe(false)
+  })
+
+  test('accepts an image of exactly the cap', async () => {
+    const exact = new Uint8Array(3_932_160)
+    const { clock, api, deadline, store } = repliesSetup([withImages('6', 600, [host('a.png')])], {}, () => ({ type: 'image/png', chunks: [exact] }))
+    const result = await settleWithDisk(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))
+    expect(result.replies[0]!.images).toEqual([{ name: '6-0.png', path: 'replies/6-0.png' }])
+  })
+
+  test('keeps the link for a wrong content type, an error status or a failed request', async () => {
+    const replies: Record<string, ImageReply> = { 'a.svg': { type: 'image/svg+xml' }, 'b.html': { type: 'text/html' }, 'c.png': { status: 403, type: 'image/png' }, 'd.png': 'fail', 'e.png': { type: 'image/png' } }
+    const { clock, api, deadline, store } = repliesSetup([withImages('6', 600, Object.keys(replies).slice(0, 4).map(host)), withImages('7', 700, [host('e.png')])], {}, (url) => replies[url.split('/').at(-1)!]!)
+    const result = await settleWithDisk(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))
+    expect(result.replies[0]!.images).toEqual([])
+    expect(result.replies[0]!.text.split('\n')).toHaveLength(5)
+    expect(result.replies[1]).toEqual({ id: '7', author: 'Ploy', text: 'see', images: [{ name: '7-0.png', path: 'replies/7-0.png' }] })
+  })
+
+  test('gives up on an image after ten seconds and still returns the replies', async () => {
+    const { clock, api, deadline, store, images } = repliesSetup([withImages('6', 600, [host('slow.png')])], {}, () => 'hang')
+    const result = await drain(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))
+    expect(result.replies[0]).toEqual({ id: '6', author: 'Ploy', text: `see\nImage: ${host('slow.png')}`, images: [] })
+    expect(images.calls[0]!.init?.signal?.aborted).toBe(true)
+    expect(clock.now()).toBeGreaterThanOrEqual(10000)
+    expect(clock.now()).toBeLessThan(11000)
+  })
+
+  test('downloads at most four images per reply and keeps the rest as links', async () => {
+    const urls = Array.from({ length: 6 }, (_, index) => host(`${index}.png`))
+    const { clock, api, deadline, store, images } = repliesSetup([withImages('6', 600, urls)], {}, () => ({ type: 'image/png' }))
+    const result = await settleWithDisk(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))
+    expect(images.calls).toHaveLength(4)
+    expect(result.replies[0]!.images.map((image) => image.name)).toEqual(['6-0.png', '6-1.png', '6-2.png', '6-3.png'])
+    expect(result.replies[0]!.text).toBe(`see\nImage: ${host('4.png')}\nImage: ${host('5.png')}`)
+  })
+
+  test('downloads at most eight images per result, oldest replies first', async () => {
+    const urls = (id: string) => Array.from({ length: 4 }, (_, index) => host(`${id}-${index}.png`))
+    const { clock, api, deadline, store, images } = repliesSetup([withImages('9', 900, urls('9')), withImages('7', 700, urls('7')), withImages('8', 800, urls('8'))], {}, () => ({ type: 'image/png' }))
+    const result = await settleWithDisk(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, store))
+    expect(images.calls).toHaveLength(8)
+    expect(result.replies.map((reply) => reply.images.length)).toEqual([4, 4, 0])
+    expect(result.replies[2]!.text.split('\n')).toHaveLength(5)
+  })
+
+  test('skips downloads when the plugin has no data folder', async () => {
+    const { clock, api, deadline, store, images } = repliesSetup([withImages('6', 600, [host('a.png')])], {}, () => ({ type: 'image/png' }))
+    const result = await settleWithDisk(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline, { ...store, data: '' }))
+    expect(images.calls).toHaveLength(0)
+    expect(result.replies[0]!.text).toBe(`see\nImage: ${host('a.png')}`)
   })
 })

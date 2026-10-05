@@ -10,7 +10,7 @@
   "screen": "src/screen.ts",
   "queueSource": true,
   "permissions": {
-    "network": ["api.clickup.com"],
+    "network": ["api.clickup.com", "*.clickup-attachments.com"],
     "sessions": ["chat", "terminal"],
     "settings": true
   },

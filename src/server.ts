@@ -188,7 +188,7 @@ export function createMethods(deps: PluginDeps = {}) {
       withClickUp(ctx, (api, deadline) => sourcePost(api, params, deadline, clock.now())),
 
     'source.replies': async (params: { id: string; sinceId: string | null }, ctx: ServerContext) =>
-      withClickUp(ctx, (api, deadline) => sourceReplies(api, params, deadline)),
+      withClickUp(ctx, (api, deadline) => sourceReplies(api, params, deadline, { data: ctx.data, fetch: deps.fetch ?? fetch, clock })),
   }
 }
 

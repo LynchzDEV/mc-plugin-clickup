@@ -1,6 +1,7 @@
 import type { ClickUp } from './clickup-api'
 import type { Clock, Deadline } from './deadline'
 import { buildDossier } from './dossier'
+import { downloadReplyImages, isAttachmentUrl, MAX_IMAGES_PER_REPLY, MAX_IMAGES_PER_RESULT, type DownloadedImage, type ImageStore, type SavedImage } from './reply-images'
 
 export const MC_MARKER = '— Mission Control'
 export const ASK_HEADER = 'ขอถามเพิ่มเติมก่อนเริ่มงานนี้นิดนึงครับ'
@@ -46,7 +47,7 @@ export async function sourcePost(api: ClickUp, input: { id: string; kind: 'ask';
 
 type RawComment = { id?: string | number; date?: string | number; comment_text?: string; user?: { username?: string }; reply_count?: number | string; comment?: unknown }
 type CommentList = { comments?: RawComment[] }
-export type SourceReply = { id: string; author: string; text: string; images: [] }
+export type SourceReply = { id: string; author: string; text: string; images: SavedImage[] }
 
 function imageLinks(parts: unknown): string[] {
   if (!Array.isArray(parts)) return []
@@ -64,19 +65,34 @@ export function isOwnAsk(text: string): boolean {
   return lines[0] === ASK_HEADER && lines.at(-1) === MC_MARKER
 }
 
-function toReply(raw: RawComment): SourceReply {
-  const text = [(raw.comment_text ?? '').trim(), ...imageLinks(raw.comment).map((url) => `Image: ${url}`)].filter((line) => line !== '').join('\n')
+function toReply(raw: RawComment, links: string[], downloaded: DownloadedImage[]): SourceReply {
+  const saved = new Set(downloaded.map((item) => item.url))
+  const linkLines = links.filter((url) => !saved.has(url)).map((url) => `Image: ${url}`)
+  const text = [(raw.comment_text ?? '').trim(), ...linkLines].filter((line) => line !== '').join('\n')
   return {
     id: String(raw.id).slice(0, MAX_REPLY_ID),
     author: (raw.user?.username ?? 'someone').slice(0, MAX_AUTHOR),
     text: text.slice(0, MAX_REPLY_TEXT),
-    images: [],
+    images: downloaded.map((item) => item.image),
   }
+}
+
+type ImagePlan = { raw: RawComment; links: string[]; wanted: string[] }
+
+function planImages(comments: RawComment[]): ImagePlan[] {
+  return comments.reduce<{ plans: ImagePlan[]; left: number }>(
+    ({ plans, left }, raw) => {
+      const links = imageLinks(raw.comment)
+      const wanted = links.filter(isAttachmentUrl).slice(0, Math.min(MAX_IMAGES_PER_REPLY, left))
+      return { plans: [...plans, { raw, links, wanted }], left: left - wanted.length }
+    },
+    { plans: [], left: MAX_IMAGES_PER_RESULT },
+  ).plans
 }
 
 const dateOf = (raw: RawComment): number => Number(raw.date ?? 0)
 
-export async function sourceReplies(api: ClickUp, input: { id: string; sinceId: string | null }, deadline: Deadline): Promise<{ replies: SourceReply[]; lastId: string | null }> {
+export async function sourceReplies(api: ClickUp, input: { id: string; sinceId: string | null }, deadline: Deadline, images: ImageStore): Promise<{ replies: SourceReply[]; lastId: string | null }> {
   const task = taskId(input.id)
   const since = Number(input.sinceId ?? 0)
   const top = ((await api.get(`/task/${task}/comment`, deadline)) as CommentList).comments ?? []
@@ -90,5 +106,8 @@ export async function sourceReplies(api: ClickUp, input: { id: string; sinceId: 
     .filter((raw) => dateOf(raw) > since && !isOwnAsk(raw.comment_text ?? ''))
     .sort((a, b) => dateOf(a) - dateOf(b))
     .slice(-MAX_REPLIES)
-  return { replies: fresh.map(toReply), lastId: newest > since ? String(newest) : input.sinceId }
+  const replies = await Promise.all(
+    planImages(fresh).map(async ({ raw, links, wanted }) => toReply(raw, links, await downloadReplyImages(String(raw.id), wanted, images, deadline))),
+  )
+  return { replies, lastId: newest > since ? String(newest) : input.sinceId }
 }
