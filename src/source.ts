@@ -3,6 +3,7 @@ import type { Clock, Deadline } from './deadline'
 import { buildDossier } from './dossier'
 
 export const MC_MARKER = '— Mission Control'
+export const ASK_HEADER = 'ขอถามเพิ่มเติมก่อนเริ่มงานนี้นิดนึงครับ'
 const TASK_ID = /^[A-Za-z0-9_-]{1,40}$/
 const MAX_TITLE = 500
 const MAX_URL = 2048
@@ -24,7 +25,7 @@ function taskId(id: unknown): string {
 
 export function askText(lines: string[]): string {
   const numbered = lines.map((line, index) => `${index + 1}. ${line}`).join('\n')
-  return `ขอถามเพิ่มเติมก่อนเริ่มงานนี้นิดนึงครับ\n\n${numbered}\n\nตอบใต้คอมเมนต์นี้หรือคอมเมนต์ใหม่ได้เลยครับ\n${MC_MARKER}`
+  return `${ASK_HEADER}\n\n${numbered}\n\nตอบใต้คอมเมนต์นี้หรือคอมเมนต์ใหม่ได้เลยครับ\n${MC_MARKER}`
 }
 
 export async function sourceItem(api: ClickUp, id: string, deadline: Deadline, clock: Clock): Promise<{ title: string; url: string; contextMarkdown: string }> {
@@ -58,6 +59,11 @@ function imageLinks(parts: unknown): string[] {
   })
 }
 
+export function isOwnAsk(text: string): boolean {
+  const lines = text.split('\n').map((line) => line.trim()).filter((line) => line !== '')
+  return lines[0] === ASK_HEADER && lines.at(-1) === MC_MARKER
+}
+
 function toReply(raw: RawComment): SourceReply {
   const text = [(raw.comment_text ?? '').trim(), ...imageLinks(raw.comment).map((url) => `Image: ${url}`)].filter((line) => line !== '').join('\n')
   return {
@@ -81,7 +87,7 @@ export async function sourceReplies(api: ClickUp, input: { id: string; sinceId: 
   const all = [...top, ...threads.flat()]
   const newest = all.reduce((max, raw) => Math.max(max, dateOf(raw)), since)
   const fresh = all
-    .filter((raw) => dateOf(raw) > since && !(raw.comment_text ?? '').includes(MC_MARKER))
+    .filter((raw) => dateOf(raw) > since && !isOwnAsk(raw.comment_text ?? ''))
     .sort((a, b) => dateOf(a) - dateOf(b))
     .slice(-MAX_REPLIES)
   return { replies: fresh.map(toReply), lastId: newest > since ? String(newest) : input.sinceId }

@@ -135,8 +135,8 @@ describe('sourceReplies', () => {
     expect(result.lastId).toBe('300')
   })
 
-  test('skips comments carrying the marker but still advances the cursor past them', async () => {
-    const { clock, api, deadline } = repliesSetup([comment('4', 400, 'ขอถาม…\n— Mission Control'), comment('3', 300, 'answer')])
+  test('skips the Mission Control ask but still advances the cursor past it', async () => {
+    const { clock, api, deadline } = repliesSetup([comment('4', 400, `${askText(['หน้าไหนครับ'])}\n`), comment('3', 300, 'answer')])
     const result = await settle(clock, sourceReplies(api, { id: 't1', sinceId: '100' }, deadline))
     expect(result.replies.map((reply) => reply.text)).toEqual(['answer'])
     expect(result.lastId).toBe('400')
@@ -213,5 +213,29 @@ describe('sourceReplies', () => {
     const { clock, api, deadline } = repliesSetup([{ id: 77, date: 800, comment_text: '  hi  ' }])
     const result = await settle(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline))
     expect(result.replies).toEqual([{ id: '77', author: 'someone', text: 'hi', images: [] }])
+  })
+})
+
+describe('sourceReplies own-ask detection', () => {
+  const ask = askText(['หน้าไหนครับ', 'Thai or English?'])
+
+  test('returns a reply that quotes the whole question and answers below it', async () => {
+    const quoted = `${ask}\n\n1. หน้า login\n2. Thai`
+    const { clock, api, deadline } = repliesSetup([comment('7', 700, quoted)])
+    const result = await settle(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline))
+    expect(result.replies.map((reply) => reply.text)).toEqual([quoted])
+  })
+
+  test('returns a comment that ends with the marker but lacks the ask header', async () => {
+    const signed = 'ok ทำได้เลย\n— Mission Control'
+    const { clock, api, deadline } = repliesSetup([comment('7', 700, signed)])
+    const result = await settle(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline))
+    expect(result.replies.map((reply) => reply.text)).toEqual([signed])
+  })
+
+  test('skips the ask even with blank lines and spaces around it', async () => {
+    const { clock, api, deadline } = repliesSetup([comment('7', 700, `\n  ${ask.replace('\n— Mission Control', '\n  — Mission Control  ')}\n\n`)])
+    const result = await settle(clock, sourceReplies(api, { id: 't1', sinceId: null }, deadline))
+    expect(result).toEqual({ replies: [], lastId: '700' })
   })
 })
