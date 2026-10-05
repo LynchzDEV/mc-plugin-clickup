@@ -38,6 +38,7 @@ export type RequestGuard = () => void
 
 export interface ClickUp {
   get(path: string, deadline: Deadline, guard?: RequestGuard): Promise<unknown>
+  post(path: string, body: unknown, deadline: Deadline): Promise<unknown>
 }
 
 type Waiter = { proceed: () => void; stop: () => void }
@@ -95,12 +96,17 @@ export function createClickUp(token: string, deps: ClickUpDeps = {}): ClickUp {
   const queue = tokenQueues.get(token) ?? new RequestQueue()
   tokenQueues.set(token, queue)
 
-  async function get(path: string, deadline: Deadline, guard?: RequestGuard): Promise<unknown> {
+  async function send(
+    path: string,
+    deadline: Deadline,
+    guard: RequestGuard | undefined,
+    init: RequestInit,
+  ): Promise<unknown> {
     if (deadline.expired()) throw new Error(DEADLINE_ERROR)
     await queue.acquire(deadline)
     try {
       guard?.()
-      const first = await request(path, deadline)
+      const first = await request(path, deadline, init)
       if (first.status !== 429) return first.body
       const retryAfter = first.retryAfterSeconds
       const canRetry =
@@ -110,7 +116,7 @@ export function createClickUp(token: string, deps: ClickUpDeps = {}): ClickUp {
       if (!canRetry) throw new RateLimited(retryAfter ?? DEFAULT_RETRY_AFTER_SECONDS)
       await clock.sleep(retryAfter * 1000)
       guard?.()
-      const second = await request(path, deadline)
+      const second = await request(path, deadline, init)
       if (second.status === 429) {
         throw new RateLimited(second.retryAfterSeconds ?? DEFAULT_RETRY_AFTER_SECONDS)
       }
@@ -120,7 +126,7 @@ export function createClickUp(token: string, deps: ClickUpDeps = {}): ClickUp {
     }
   }
 
-  async function request(path: string, deadline: Deadline): Promise<FetchOutcome> {
+  async function request(path: string, deadline: Deadline, init: RequestInit): Promise<FetchOutcome> {
     if (deadline.expired()) throw new Error(DEADLINE_ERROR)
     const requestController = new AbortController()
     const cancelTimer = clock.setTimer(Math.min(REQUEST_TIMEOUT_MS, deadline.remaining()), () => {
@@ -128,7 +134,8 @@ export function createClickUp(token: string, deps: ClickUpDeps = {}): ClickUp {
     })
     try {
       const response = await fetchImpl(CLICKUP_BASE + path, {
-        headers: { Authorization: token },
+        ...init,
+        headers: { Authorization: token, ...(init.headers as Record<string, string> | undefined) },
         signal: AbortSignal.any([deadline.signal, requestController.signal]),
       })
       if (response.status === 429) {
@@ -145,7 +152,15 @@ export function createClickUp(token: string, deps: ClickUpDeps = {}): ClickUp {
     }
   }
 
-  return { get }
+  const get = (path: string, deadline: Deadline, guard?: RequestGuard) => send(path, deadline, guard, {})
+  const post = (path: string, body: unknown, deadline: Deadline) =>
+    send(path, deadline, undefined, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+
+  return { get, post }
 }
 
 function parseRetryAfter(header: string | null): number | null {

@@ -6,12 +6,14 @@ export type RecordedCall = {
   url: string
   path: string
   query: URLSearchParams
+  method: string
+  body: unknown
   startedAt: number
   abortedAt?: number
   abortReason?: unknown
 }
 
-export type Responder = (call: { path: string; query: URLSearchParams }) => FakeReply | 'hang'
+export type Responder = (call: { path: string; query: URLSearchParams; method: string; body: unknown }) => FakeReply | 'hang'
 
 export type FakeClickUp = { fetchImpl: typeof fetch; calls: RecordedCall[]; maxInFlight(): number }
 
@@ -25,10 +27,14 @@ export function fakeClickUp(clock: FakeClock, respond: Responder): FakeClickUp {
   const fetchImpl = ((input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const url = new URL(String(input))
     const signal = init?.signal ?? new AbortController().signal
+    const method = (init?.method ?? 'GET').toUpperCase()
+    const requestBody = typeof init?.body === 'string' ? JSON.parse(init.body) : undefined
     const call: RecordedCall = {
       url: url.toString(),
       path: url.pathname.startsWith(API_PREFIX) ? url.pathname.slice(API_PREFIX.length) : url.pathname,
       query: url.searchParams,
+      method,
+      body: requestBody,
       startedAt: clock.now(),
     }
     calls.push(call)
@@ -45,7 +51,7 @@ export function fakeClickUp(clock: FakeClock, respond: Responder): FakeClickUp {
       reject(signal.reason)
     }
 
-    const reply = respond({ path: call.path, query: call.query })
+    const reply = respond({ path: call.path, query: call.query, method, body: requestBody })
     if (reply === 'hang') {
       return new Promise<Response>((_resolve, reject) => {
         if (signal.aborted) abort(reject)

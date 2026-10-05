@@ -290,3 +290,49 @@ describe('the per-token queue', () => {
     expect(fake.calls[4].startedAt).toBe(10000)
   })
 })
+
+async function post(clock: FakeClock, api: ClickUp, path: string, body: unknown, deadlineMs = 25000): Promise<unknown> {
+  const deadline = createDeadline(deadlineMs, clock)
+  try {
+    return await settle(clock, api.post(path, body, deadline))
+  } finally {
+    deadline.dispose()
+  }
+}
+
+describe('post', () => {
+  test('sends JSON with the token and returns the body', async () => {
+    const clock = fakeClock()
+    const fake = fakeClickUp(clock, ({ method, path }) =>
+      method === 'POST' && path === '/task/t1/comment' ? { body: { id: 'c1', date: '1700' } } : { status: 404 },
+    )
+    const sentHeaders: Array<HeadersInit | undefined> = []
+    const spy = ((input: string | URL | Request, init?: RequestInit) => {
+      sentHeaders.push(init?.headers)
+      return fake.fetchImpl(input, init)
+    }) as typeof fetch
+    const api = createClickUp('pk_post_json', { fetch: spy, clock })
+
+    expect(await post(clock, api, '/task/t1/comment', { comment_text: 'hi' })).toEqual({ id: 'c1', date: '1700' })
+    expect(fake.calls[0].method).toBe('POST')
+    expect(fake.calls[0].body).toEqual({ comment_text: 'hi' })
+    expect(sentHeaders[0]).toEqual({ Authorization: 'pk_post_json', 'content-type': 'application/json' })
+  })
+
+  test('post shares the 429 handling', async () => {
+    const { api, clock } = makeApi(() => ({ status: 429, headers: { 'retry-after': '30' } }), 'pk_post_429')
+    const failure = await outcome(post(clock, api, '/task/t1/comment', { comment_text: 'hi' }))
+    expect(failure.ok).toBe(false)
+    if (!failure.ok) {
+      expect(failure.error).toBeInstanceOf(RateLimited)
+      expect((failure.error as Error).message).toBe('ClickUp is busy, try again in 30 s')
+    }
+  })
+
+  test('post maps 401 to TokenRejected', async () => {
+    const { api, clock } = makeApi(() => ({ status: 401 }), 'pk_post_401')
+    const failure = await outcome(post(clock, api, '/task/t1/comment', { comment_text: 'hi' }))
+    expect(failure.ok).toBe(false)
+    if (!failure.ok) expect(failure.error).toBeInstanceOf(TokenRejected)
+  })
+})
