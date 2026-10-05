@@ -8,6 +8,7 @@
   "icon": "assets/icon.svg",
   "server": "src/server.ts",
   "screen": "src/screen.ts",
+  "queueSource": true,
   "permissions": {
     "network": ["api.clickup.com"],
     "sessions": ["chat", "terminal"],
