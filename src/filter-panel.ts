@@ -5,11 +5,12 @@ import { esc } from './view'
 export type PanelState = { open: boolean; picking: number | null }
 
 export const FILTER_STYLES = `
+[data-region="filters"] { position: relative; }
 .mk-filter-bar { display: flex; align-items: center; gap: 10px; margin: -6px 0 14px; position: relative; }
 .mk-filter-bar input[type="search"] { flex: 0 1 280px; font-size: 13px; padding: 8px 11px; border: 0; border-radius: var(--r-sm, 8px); background: var(--field, #e2e6f0); color: inherit; }
 .mk-filter-btn[data-active] { border-color: var(--accent, #8062bd); color: var(--accent, #8062bd); background: color-mix(in srgb, var(--accent, #8062bd) 10%, transparent); }
 .mk-filter-count { font-size: 12px; color: var(--muted, #626e82); }
-.mk-filters { position: absolute; top: 44px; left: 0; z-index: 30; width: min(760px, 100%); display: grid; gap: 10px; padding: 18px 20px; border-radius: var(--r-lg, 16px); background: var(--paper, #eaedf6); box-shadow: var(--dialog-shadow, 0 12px 35px #737ea333); }
+.mk-filters { position: absolute; top: 40px; left: 0; z-index: 30; width: min(760px, 100%); display: grid; gap: 10px; padding: 18px 20px; border-radius: var(--r-lg, 16px); background: var(--paper, #eaedf6); box-shadow: var(--dialog-shadow, 0 12px 35px #737ea333); }
 .mk-filters > header { display: flex; align-items: center; gap: 10px; }
 .mk-filters > header strong { font-size: 15px; font-weight: 500; color: var(--text-strong, #344155); }
 .mk-filters > header .sp, .mk-filters > footer .sp { flex: 1; }
