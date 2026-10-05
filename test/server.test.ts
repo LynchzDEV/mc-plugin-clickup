@@ -444,3 +444,33 @@ describe('board.view', () => {
     expect(given.columns[0].tasks.map((task: { id: string }) => task.id)).toEqual(['t2'])
   })
 })
+
+describe('source methods', () => {
+  test('source methods need a token', async () => {
+    const { methods, fake } = makePlugin(() => ({ body: {} }))
+    const { ctx } = makeCtx({})
+    await expect(methods['source.item']({ id: 't1' }, ctx)).rejects.toThrow('Connect ClickUp first')
+    await expect(methods['source.post']({ id: 't1', kind: 'ask', lines: ['q'] }, ctx)).rejects.toThrow('Connect ClickUp first')
+    await expect(methods['source.replies']({ id: 't1', sinceId: null }, ctx)).rejects.toThrow('Connect ClickUp first')
+    expect(fake.calls).toHaveLength(0)
+  })
+
+  test('source.post goes through to ClickUp', async () => {
+    const { methods, ctx, clock } = tokened(({ path, method }) =>
+      method === 'POST' && path === '/task/t1/comment' ? { body: { id: 'c', date: 1700 } } : { status: 404, body: {} },
+    )
+    expect(await call(clock, methods['source.post']({ id: 't1', kind: 'ask', lines: ['Which page?'] }, ctx))).toEqual({ commentId: '1700' })
+  })
+
+  test('source.item and source.replies go through to ClickUp', async () => {
+    const { methods, ctx, clock } = tokened(({ path }) => {
+      if (path === '/task/t1') return { body: { id: 't1', name: 'Login copy' } }
+      if (path === '/task/t1/comment') return { body: { comments: [{ id: '2', date: '200', comment_text: 'ok', user: { username: 'Ploy' } }] } }
+      return { status: 404, body: {} }
+    })
+    const item = await call(clock, methods['source.item']({ id: 't1' }, ctx))
+    expect(item.title).toBe('Login copy')
+    const replies = await call(clock, methods['source.replies']({ id: 't1', sinceId: '100' }, ctx))
+    expect(replies).toEqual({ replies: [{ id: '2', author: 'Ploy', text: 'ok', images: [] }], lastId: '200' })
+  })
+})
